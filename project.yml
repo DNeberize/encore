@@ -1,0 +1,43 @@
+# XcodeGen spec: `xcodegen generate` creates Encore.xcodeproj (done by CI).
+name: Encore
+options:
+  bundleIdPrefix: app.encore
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+targets:
+  Encore:
+    type: application
+    platform: iOS
+    sources:
+      - path: Encore
+    scheme: {}
+    info:
+      path: Support/Info.plist
+      properties:
+        CFBundleDisplayName: Encore
+        CFBundleName: Encore
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        ITSAppUsesNonExemptEncryption: false
+        UIBackgroundModes: [audio]
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoadsInWebContent: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.encore.player
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "5.0"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_PREVIEWS: NO

@@ -1,0 +1,7 @@
+Encore.xcodeproj/
+Support/
+build/
+Payload/
+*.ipa
+.DS_Store
+xcuserdata/
