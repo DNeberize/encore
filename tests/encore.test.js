@@ -241,7 +241,7 @@ async function startPlaying(p) {
     p.systemPause();                          // WebKit pauses the video
     await sleep(80);
     p.api.setBackground(true);               // did enter background
-    await sleep(80);
+    await sleep(400);
     expect(!p.video.paused, 'should be playing again');
     expect(p.posted().every((m) => m.event !== 'pause'), 'lock screen never shown as paused');
   });
@@ -252,7 +252,7 @@ async function startPlaying(p) {
     p.systemPause();
     await sleep(120);
     p.api.setBackground(true);
-    await sleep(80);
+    await sleep(400);
     expect(!p.video.paused, 'should be playing again');
   });
 
@@ -284,6 +284,63 @@ async function startPlaying(p) {
     p.video.pause();                          // user taps pause in YouTube
     await sleep(400);
     expect(p.video.paused, 'user pause respected');
+  });
+
+  await test('LOCK SCREEN pause (iOS controls) in background: stays paused, never auto-resumed', async (page) => {
+    const p = page({ nativeMediaSession: true });
+    p.run('window.__ytPause = 0; navigator.mediaSession.setActionHandler("pause", () => { window.__ytPause++; window.__test.video.pause(); })');
+    await startPlaying(p);
+    p.api.prepareBackground();
+    p.api.setBackground(true);               // phone locked, music playing
+    await sleep(100);
+    p.run('navigator.mediaSession.native.pause({ action: "pause" })');   // tap pause on lock screen
+    await sleep(3000);
+    expect(p.video.paused, 'stays paused');
+    expect(p.run('window.__ytPause') === 1, 'YouTube handler still used');
+    p.api.kick();
+    await sleep(50);
+    expect(p.video.paused, 'app nudges never override it');
+  });
+
+  await test('LOCK SCREEN play (iOS controls) resumes; pause works even without YouTube handlers', async (page) => {
+    const p = page({ nativeMediaSession: true });
+    await startPlaying(p);
+    p.api.setBackground(true);
+    p.run('navigator.mediaSession.native.pause({ action: "pause" })');
+    await sleep(800);
+    expect(p.video.paused, 'paused from lock screen');
+    p.run('navigator.mediaSession.native.play({ action: "play" })');
+    await sleep(80);
+    expect(!p.video.paused, 'play from lock screen resumes');
+  });
+
+  await test('page alone detects leaving the screen (no app notices) and resumes', async (page) => {
+    const p = page();
+    await startPlaying(p);
+    p.systemPause();                          // WebKit pauses first...
+    await sleep(60);
+    p.run('window.__reallyHidden = true; window.__test.dispatch(document, "visibilitychange")');  // ...then page goes hidden
+    await sleep(400);
+    expect(!p.video.paused, 'resumed from inside the page');
+  });
+
+  await test('pause long after the screen went off (e.g. headphones) is not undone', async (page) => {
+    const p = page();
+    await startPlaying(p);
+    p.run('window.__reallyHidden = true; window.__test.dispatch(document, "visibilitychange")');
+    await sleep(2700);                        // locked for a while, still playing
+    expect(!p.video.paused, 'still playing while locked');
+    p.systemPause();                          // something stops it later
+    await sleep(900);
+    expect(p.video.paused, 'left paused');
+  });
+
+  await test("YouTube's own pause while you're using the app is left alone", async (page) => {
+    const p = page();
+    await startPlaying(p);
+    p.systemPause();                          // e.g. YouTube pauses itself
+    await sleep(900);
+    expect(p.video.paused, 'not fought');
   });
 
   await test('lock screen pause in background stays paused', async (page) => {
@@ -398,14 +455,15 @@ async function startPlaying(p) {
     expect(p.video.paused, 'stays paused');
   });
 
-  await test('song ends in background: jumps to next via YouTube handler', async (page) => {
+  await test('song ends in background: no forced skip (YouTube autoplay decides)', async (page) => {
     const p = page();
     p.run('window.__nexts = 0; navigator.mediaSession.setActionHandler("nexttrack", () => window.__nexts++)');
     await startPlaying(p);
     p.api.setBackground(true);
     p.video.finish();
-    await sleep(100);
-    expect(p.run('window.__nexts') === 1, 'next handler called once');
+    await sleep(400);
+    expect(p.run('window.__nexts') === 0, 'app must not skip on its own');
+    expect(p.video.paused, 'ended song is not restarted');
   });
 
   await test('lock screen next / previous', async (page) => {
@@ -532,40 +590,6 @@ async function startPlaying(p) {
       cw.fetch !== 'clean' && cw.Request === window.Request && cw.JSON.parse === JSON.parse
     `);
     expect(ok === true, 'iframe patched');
-  });
-
-  await test('miniplayer: tapping a video in YouTube opens it in the player, page stays put', async (page) => {
-    const p = page();
-    p.run(`window.__link = { closest: () => ({ getAttribute: () => '/watch?v=xyz&list=RD1' }) }`);
-    const ev = p.run(`(() => { const e = { type: 'click', target: window.__link, isTrusted: true, defaultPrevented: false,
-      preventDefault() { this.defaultPrevented = true; }, stopImmediatePropagation() { this.stopped = true; } };
-      (window.capture.click || []).forEach(f => f(e)); return e; })()`);
-    expect(ev.defaultPrevented && ev.stopped, 'YouTube navigation cancelled');
-    const m = p.posted().find((x) => x.type === 'openVideo');
-    expect(m && m.url === 'https://m.youtube.com/watch?v=xyz&list=RD1', 'player asked to open: ' + JSON.stringify(m));
-  });
-
-  await test('miniplayer: inside the player, related videos stay; home/search go to the tab', async (page) => {
-    const p = page({ role: 'player' });
-    const click = (href) => p.run(`(() => { const e = { type: 'click', isTrusted: true, defaultPrevented: false,
-      target: { closest: () => ({ getAttribute: () => ${JSON.stringify(href)} }) },
-      preventDefault() { this.defaultPrevented = true; }, stopImmediatePropagation() {} };
-      (window.capture.click || []).forEach(f => f(e)); return e.defaultPrevented; })()`);
-    expect(click('/watch?v=next1') === false, 'related video plays in the player');
-    expect(click('/results?search_query=x') === true, 'search handed to the tab');
-    const m = p.posted().find((x) => x.type === 'openInBrowser');
-    expect(m && m.url.endsWith('/results?search_query=x'), 'tab asked to open search');
-  });
-
-  await test('miniplayer: script navigation to a video is handed over and the page steps back', async (page) => {
-    const p = page();
-    p.run('history.pushState({}, "", "/watch?v=scripted")');
-    await sleep(30);
-    expect(p.posted().some((x) => x.type === 'openVideo' && x.url.includes('v=scripted')), 'handed to player');
-    expect(p.run('history.backs') === 1, 'browse page returned to where it was');
-    p.run('history.pushState({}, "", "/results?search_query=a")');
-    await sleep(30);
-    expect(p.run('history.backs') === 1, 'normal navigation untouched');
   });
 
   await test('ad blocking off: player responses untouched', async () => {

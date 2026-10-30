@@ -7,8 +7,8 @@ An iPhone browser built to use YouTube as a music player.
 - Keeps playing when you go to the Home Screen, switch apps or lock the phone
 - Shows lock screen and Control Center controls: play/pause, next, previous, a scrubber and artwork
 - Remembers your YouTube/Google login and your open tabs
-- Has a YouTube-app-style miniplayer: videos open in a player that slides up; swipe it down (or tap ⌄) and it shrinks to a bar while you keep scrolling home or search exactly where you left off
-- Lets you use tabs: music keeps playing while you browse other sites
+- Lets you use tabs: music keeps playing while you browse other sites, with a small player bar to control it
+- YouTube Music (••• menu) has YouTube's own player bar that stays at the bottom while you browse
 - Sleep timer, swipe back/forward, and AirPlay and Picture in Picture support
 - Pauses for phone and VoIP calls (FaceTime, WhatsApp, ...) for the whole call and picks back up when it ends
 - Pauses when headphones are unplugged or AirPods/Bluetooth disconnect (or when you take AirPods out), and stays paused
@@ -86,7 +86,7 @@ project.yml                 XcodeGen spec (CI turns it into an Xcode project)
 .github/workflows/build.yml Cloud build → unsigned Encore.ipa
 Encore/App                  App entry point
 Encore/Browser              Tabs, WKWebView setup, ad-block loading, URL handling
-Encore/Media                Audio session, lock screen info, remote controls, sleep timer
+Encore/Media                Audio session, calls/headphones, sleep timer (lock screen controls are iOS's own)
 Encore/UI                   SwiftUI screens (toolbar, tabs, mini player)
 Encore/Resources/encore.js  Injected page script: background play, ad removal, media bridge
 Encore/Resources/blocklist.json  Network/cosmetic ad block rules

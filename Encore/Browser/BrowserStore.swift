@@ -1,9 +1,8 @@
 import SwiftUI
 import WebKit
 
-/// Owns every tab, the miniplayer, and the pieces they share: cookies/logins
-/// (the default website data store), the injected page script and the
-/// ad-block rule list.
+/// Owns every tab plus the pieces they share: cookies/logins (the default
+/// website data store), the injected page script and the ad-block rule list.
 @MainActor
 final class BrowserStore: ObservableObject {
     static let home = URL(string: "https://m.youtube.com/")!
@@ -11,33 +10,23 @@ final class BrowserStore: ObservableObject {
 
     @Published private(set) var tabs: [BrowserTab] = []
     @Published private(set) var selectedID: UUID?
-
-    /// Videos play here, YouTube-app style: full screen when expanded, a bar
-    /// above the toolbar when collapsed, while tabs keep their place.
-    @Published private(set) var player: BrowserTab?
-    @Published var playerExpanded = false
-
     @Published var adBlockEnabled: Bool {
         didSet {
             guard adBlockEnabled != oldValue else { return }
             UserDefaults.standard.set(adBlockEnabled, forKey: Keys.adBlock)
             applyContentRules()
             installScripts()
-            allTabs.forEach { $0.reloadIfLoaded() }
+            tabs.forEach { $0.reloadIfLoaded() }
         }
     }
 
-    /// Normal tabs and the player get the same script, told which role they play.
-    private let tabContent = WKUserContentController()
-    private let playerContent = WKUserContentController()
+    private let userContent = WKUserContentController()
     private let router = ScriptMessageRouter()
     private var ruleList: WKContentRuleList?
     private var lifecycleObservers: [NSObjectProtocol] = []
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
 
     var selectedTab: BrowserTab? { tabs.first { $0.id == selectedID } }
-
-    private var allTabs: [BrowserTab] { player.map { tabs + [$0] } ?? tabs }
 
     private enum Keys {
         static let adBlock = "adBlockEnabled"
@@ -48,8 +37,7 @@ final class BrowserStore: ObservableObject {
     init() {
         adBlockEnabled = UserDefaults.standard.object(forKey: Keys.adBlock) as? Bool ?? true
         router.store = self
-        tabContent.add(router, name: "encore")
-        playerContent.add(router, name: "encore")
+        userContent.add(router, name: "encore")
         installScripts()
         observeAppLifecycle()
 
@@ -105,73 +93,34 @@ final class BrowserStore: ObservableObject {
     func newTab() { openTab(url: Self.home) }
 
     func open(_ url: URL) {
-        if let video = URLResolver.youTubeVideo(url) {
-            openVideo(video)
-        } else if let tab = selectedTab {
-            tab.load(url)
-        } else {
-            openTab(url: url)
-        }
+        if let tab = selectedTab { tab.load(url) } else { openTab(url: url) }
     }
 
-    func goHome() {
-        playerExpanded = false
-        open(Self.home)
-    }
+    func goHome() { open(Self.home) }
 
     /// Handles text typed into the address bar: a URL, a bare domain or a search.
     func submit(_ text: String) {
         let onYouTube = selectedTab?.url?.host?.contains("youtube.com") ?? true
         guard let url = URLResolver.resolve(text, preferYouTube: onYouTube) else { return }
-        playerExpanded = false
         open(url)
-    }
-
-    // MARK: - Miniplayer
-
-    func openVideo(_ url: URL) {
-        let tab: BrowserTab
-        if let existing = player {
-            tab = existing
-        } else {
-            tab = BrowserTab(configuration: makeConfiguration(forPlayer: true), store: self, isPlayer: true)
-            player = tab
-        }
-        if tab.webView.url != url { tab.load(url) }
-        playerExpanded = true
-    }
-
-    /// A non-video page opened from inside the player goes to the current tab.
-    func openInBrowser(_ url: URL, newTab: Bool = false) {
-        playerExpanded = false
-        if newTab { openTab(url: url) } else if let tab = selectedTab { tab.load(url) } else { openTab(url: url) }
-    }
-
-    func closePlayer() {
-        guard let player else { return }
-        NowPlayingCenter.shared.mediaGone(from: player)
-        player.teardown()
-        playerExpanded = false
-        self.player = nil
     }
 
     // MARK: - Lifecycle
 
-    /// iOS pauses web video when the app leaves the screen (Home Screen, app
-    /// switch, screen lock). UIKit notifications are used rather than SwiftUI's
-    /// scenePhase because they arrive *before* WebKit pauses the video:
-    ///  - will resign active: pages note what is playing right now;
-    ///  - entered background: pages resume it, retried while iOS settles.
+    /// Extra signals for the page script's playback keeper. The page resumes
+    /// iOS's background pause by itself; these just tell it a bit earlier
+    /// that the app is leaving the screen (UIKit notifications arrive before
+    /// WebKit pauses the video, unlike SwiftUI's scenePhase).
     private func observeAppLifecycle() {
         observe(UIApplication.willResignActiveNotification) { store in
-            store.allTabs.forEach { $0.run("prepareBackground()") }
+            store.tabs.forEach { $0.run("prepareBackground()") }
         }
         observe(UIApplication.didEnterBackgroundNotification) { store in
             store.saveSession()
             store.enterBackground()
         }
         observe(UIApplication.didBecomeActiveNotification) { store in
-            store.allTabs.forEach { $0.run("setBackground(false)") }
+            store.tabs.forEach { $0.run("setBackground(false)") }
         }
     }
 
@@ -184,7 +133,7 @@ final class BrowserStore: ObservableObject {
     }
 
     private func enterBackground() {
-        allTabs.forEach { $0.run("setBackground(true)") }
+        tabs.forEach { $0.run("setBackground(true)") }
 
         if backgroundTask == .invalid {
             backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "encore.resume") { [weak self] in
@@ -192,10 +141,10 @@ final class BrowserStore: ObservableObject {
             }
         }
         Task {
-            for delay: UInt64 in [150, 400, 800, 1_500, 2_500, 4_000, 6_000] {
+            for delay: UInt64 in [150, 400, 800, 1_300, 2_000] {
                 try? await Task.sleep(nanoseconds: delay * 1_000_000)
                 guard UIApplication.shared.applicationState == .background else { break }
-                allTabs.forEach { $0.run("kick()") }
+                tabs.forEach { $0.run("kick()") }
             }
             endBackgroundTask()
         }
@@ -230,9 +179,9 @@ final class BrowserStore: ObservableObject {
 
     // MARK: - Web configuration
 
-    func makeConfiguration(forPlayer: Bool = false) -> WKWebViewConfiguration {
+    func makeConfiguration() -> WKWebViewConfiguration {
         let config = WKWebViewConfiguration()
-        config.userContentController = forPlayer ? playerContent : tabContent
+        config.userContentController = userContent
         config.websiteDataStore = .default()
         config.allowsInlineMediaPlayback = true
         config.allowsPictureInPictureMediaPlayback = true
@@ -251,55 +200,39 @@ final class BrowserStore: ObservableObject {
     }
 
     private func installScripts() {
+        userContent.removeAllUserScripts()
         guard let url = Bundle.main.url(forResource: "encore", withExtension: "js"),
               let source = try? String(contentsOf: url, encoding: .utf8) else { return }
-        for (controller, role) in [(tabContent, "browse"), (playerContent, "player")] {
-            controller.removeAllUserScripts()
-            let prelude = "window.__encoreAdblock = \(adBlockEnabled); window.__encoreRole = '\(role)';\n"
-            controller.addUserScript(WKUserScript(source: prelude + source,
-                                                  injectionTime: .atDocumentStart,
-                                                  forMainFrameOnly: false))
-        }
+        let prelude = "window.__encoreAdblock = \(adBlockEnabled);\n"
+        userContent.addUserScript(WKUserScript(source: prelude + source,
+                                               injectionTime: .atDocumentStart,
+                                               forMainFrameOnly: false))
     }
 
     private func applyContentRules() {
-        for controller in [tabContent, playerContent] {
-            controller.removeAllContentRuleLists()
-            if adBlockEnabled, let ruleList { controller.add(ruleList) }
-        }
+        userContent.removeAllContentRuleLists()
+        if adBlockEnabled, let ruleList { userContent.add(ruleList) }
     }
 
     // MARK: - Page messages
 
     fileprivate func handle(_ message: WKScriptMessage) {
         guard let webView = message.webView,
-              let tab = allTabs.first(where: { $0.webView === webView }),
-              let body = message.body as? [String: Any] else { return }
+              let tab = tabs.first(where: { $0.webView === webView }),
+              let body = message.body as? [String: Any],
+              body["type"] as? String == "media" else { return }
 
-        switch body["type"] as? String {
-        case "media":
-            if body["event"] as? String == "gone" {
-                tab.isPlayingMedia = false
-                NowPlayingCenter.shared.mediaGone(from: tab)
-            } else if let state = MediaState(body) {
-                tab.isPlayingMedia = state.playing
-                NowPlayingCenter.shared.update(state, from: tab)
-            }
-        case "openVideo":
-            if !tab.isPlayer, let url = (body["url"] as? String).flatMap({ URL(string: $0) }) {
-                openVideo(URLResolver.youTubeVideo(url) ?? url)
-            }
-        case "openInBrowser":
-            if tab.isPlayer, let url = (body["url"] as? String).flatMap({ URL(string: $0) }) {
-                openInBrowser(url)
-            }
-        default:
-            break
+        if body["event"] as? String == "gone" {
+            tab.isPlayingMedia = false
+            NowPlayingCenter.shared.mediaGone(from: tab)
+        } else if let state = MediaState(body) {
+            tab.isPlayingMedia = state.playing
+            NowPlayingCenter.shared.update(state, from: tab)
         }
     }
 }
 
-/// Forwards page messages without the user content controllers retaining the store.
+/// Forwards page messages without the user content controller retaining the store.
 @MainActor
 private final class ScriptMessageRouter: NSObject, WKScriptMessageHandler {
     weak var store: BrowserStore?

@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// Compact player bar above the toolbar (collapsed miniplayer, or music
-/// playing in another tab). Tap or swipe up to open.
+/// Compact player bar above the toolbar for music playing in another tab.
+/// Tap or swipe up to switch to that tab.
 struct MiniPlayer: View {
     let title: String
     let subtitle: String

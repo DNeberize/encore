@@ -6,8 +6,6 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
     let id = UUID()
     let webView: WKWebView
     weak var store: BrowserStore?
-    /// The miniplayer's web view (plays videos) rather than a normal tab.
-    let isPlayer: Bool
 
     /// URL to load the first time the tab is shown (restored tabs load lazily).
     var pendingURL: URL?
@@ -33,10 +31,9 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
         "tel", "mailto", "sms", "facetime", "facetime-audio", "maps", "itms-apps", "itms-appss",
     ]
 
-    init(configuration: WKWebViewConfiguration, store: BrowserStore, isPlayer: Bool = false) {
+    init(configuration: WKWebViewConfiguration, store: BrowserStore) {
         webView = WKWebView(frame: .zero, configuration: configuration)
         self.store = store
-        self.isPlayer = isPlayer
         super.init()
 
         webView.navigationDelegate = self
@@ -128,21 +125,6 @@ extension BrowserTab: WKNavigationDelegate {
         }
         switch scheme {
         case "http", "https":
-            if let store, navigationAction.targetFrame?.isMainFrame == true {
-                let video = URLResolver.youTubeVideo(url)
-                let type = navigationAction.navigationType
-                if !isPlayer, let video, type != .backForward, type != .reload {
-                    // Videos always open in the miniplayer, leaving this page as it is.
-                    decisionHandler(.cancel)
-                    store.openVideo(video)
-                    return
-                }
-                if isPlayer, video == nil, type == .linkActivated {
-                    decisionHandler(.cancel)
-                    store.openInBrowser(url)
-                    return
-                }
-            }
             decisionHandler(Self.allowWithoutAppLink)
         case "about", "data", "blob", "file":
             decisionHandler(.allow)
@@ -170,16 +152,11 @@ extension BrowserTab: WKUIDelegate {
                  for navigationAction: WKNavigationAction,
                  windowFeatures: WKWindowFeatures) -> WKWebView? {
         guard navigationAction.targetFrame == nil, let store else { return nil }
-        if isPlayer {
-            // Keep the player single-purpose; pop-ups open as normal tabs.
-            if let url = navigationAction.request.url { store.openInBrowser(url, newTab: true) }
-            return nil
-        }
         return store.openTab(url: nil, configuration: configuration).webView
     }
 
     func webViewDidClose(_ webView: WKWebView) {
-        if isPlayer { store?.closePlayer() } else { store?.close(self) }
+        store?.close(self)
     }
 
     func webView(_ webView: WKWebView,

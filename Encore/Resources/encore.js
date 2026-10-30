@@ -4,10 +4,11 @@
  *  1. Pages always believe they are visible, so YouTube never pauses itself
  *     when the app goes to the background or the screen locks.
  *  2. YouTube ads are stripped from player responses before the player sees
- *     them, with a skipper + cosmetic CSS as fallback.
- *  3. (Top frame) a media bridge reports playback to the app for the lock
- *     screen, takes play/pause/next/seek commands back, and resumes playback
- *     that iOS pauses while the app is in the background.
+ *     them, with a mute-and-skip fallback and cosmetic CSS.
+ *  3. (Top frame) playback keeper: when iOS pauses the video because the app
+ *     left the screen, it is resumed on the spot. Pauses you make (in the
+ *     page, on the lock screen / Control Center, or by the app for calls and
+ *     unplugged headphones) are always respected.
  */
 (function () {
   'use strict';
@@ -36,9 +37,16 @@
   // 1. Always visible
   // ---------------------------------------------------------------------------
 
-  function constantGetter(proto, prop, value) {
+  // Keep a way to read the real state before hiding it from the page.
+  var hiddenDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden');
+  function reallyHidden() {
+    try { return !!(hiddenDesc && hiddenDesc.get && hiddenDesc.get.call(document)); } catch (e) { return false; }
+  }
+  var hiddenAt = 0;          // when the app really went off screen
+
+  function constantGetter(target, prop, value) {
     try {
-      Object.defineProperty(proto, prop, {
+      Object.defineProperty(target, prop, {
         configurable: true,
         enumerable: true,
         get: function () { return value; }
@@ -54,13 +62,17 @@
   });
   try { Document.prototype.hasFocus = function () { return true; }; } catch (e) {}
 
-  ['visibilitychange', 'webkitvisibilitychange', 'freeze'].forEach(function (type) {
-    window.addEventListener(type, function (e) { e.stopImmediatePropagation(); }, true);
+  var onRealVisibility = null;  // set by the playback keeper (top frame)
+  ['visibilitychange', 'webkitvisibilitychange'].forEach(function (type) {
+    window.addEventListener(type, function (e) {
+      e.stopImmediatePropagation();
+      if (type !== 'visibilitychange') return;
+      var hidden = reallyHidden();
+      hiddenAt = hidden ? Date.now() : 0;
+      if (onRealVisibility) onRealVisibility(hidden);
+    }, true);
   });
-  // Window losing focus (app switcher, screen lock) is another "user left" signal.
-  window.addEventListener('blur', function (e) {
-    if (e.target === window || e.target === document) e.stopImmediatePropagation();
-  }, true);
+  window.addEventListener('freeze', function (e) { e.stopImmediatePropagation(); }, true);
 
   if (IS_YT) {
     // YouTube's "Video paused. Continue watching?" checks the last-activity time.
@@ -261,44 +273,136 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 3. Media bridge (top frame only)
+  // 3. Playback keeper + media bridge (top frame only)
   // ---------------------------------------------------------------------------
 
   if (!IS_TOP) return;
 
-  var media = null;          // the element we report and control
-  var wantPlay = false;      // the user expects audio to be playing
-  var userPaused = false;    // paused on purpose (app, lock screen, headphones)
-  var background = false;    // app is in the background (set by the app)
-  var leaving = false;       // app is on its way out (resigned active, not yet background)
-  var interrupted = false;   // phone call / Siri / alarm in progress
+  var media = null;          // the audible element we follow
+  var wantPlay = false;      // music is supposed to be playing
+  var userPaused = false;    // paused on purpose: page tap, lock screen, the app (calls, headphones)
+  var interrupted = false;   // call / Siri / alarm in progress (told by the app)
   var resumeAfterInterruption = false;
+  var leaving = false;       // app resigned active (told by the app)
+  var backgroundAt = 0;      // app entered the background (told by the app)
+  var lastTouchAt = 0;
   var lastPauseAt = 0;
-  var wantedBeforePause = false;
-  var lastTouchAt = 0;       // a pause right after a real tap is the user's own
-
-  ['touchstart', 'pointerdown', 'mousedown', 'keydown'].forEach(function (type) {
-    document.addEventListener(type, function (e) {
-      if (e.isTrusted) lastTouchAt = Date.now();
-    }, true);
-  });
+  var pausedUnexplained = false;  // last pause had no known cause (may turn out to be iOS's)
   var transitionUntil = 0;   // next/previous in flight: don't fight the player
-  var resumeTimer = null;
+  var resumeTimers = [];
   var reportTimer = null;
   var lastTick = 0;
 
-  // --- Media Session: capture YouTube's metadata and next/previous handlers ---
+  function now() { return Date.now(); }
 
-  var handlers = {};
+  ['touchstart', 'touchend', 'pointerdown', 'mousedown', 'keydown'].forEach(function (type) {
+    document.addEventListener(type, function (e) { if (e.isTrusted) lastTouchAt = now(); }, true);
+  });
+
+  function userJustTouched() { return now() - lastTouchAt < 1000; }
+
+  // iOS pauses web video while the app leaves the screen (Home Screen, app
+  // switch, screen lock): from "resign active" until shortly after the page
+  // really becomes hidden.
+  function leavingScreen() {
+    return leaving ||
+      (hiddenAt > 0 && now() - hiddenAt < 2500) ||
+      (backgroundAt > 0 && now() - backgroundAt < 2500);
+  }
+
+  function safePlay(m) {
+    try {
+      var p = m.play();
+      if (p && p.catch) p.catch(function () {});
+    } catch (e) {}
+  }
+
+  function canResume() {
+    return wantPlay && !userPaused && !interrupted && !!media && media.paused && !media.ended &&
+           !adShowing() && now() > transitionUntil;
+  }
+
+  function clearResume() {
+    resumeTimers.forEach(clearTimeout);
+    resumeTimers = [];
+  }
+
+  // Resume straight away inside the page (no round trip to the app, which can
+  // arrive after iOS has frozen the page). The first try waits a beat so a
+  // call notice from the app can land first; retries cover iOS refusing or
+  // pausing again while it settles.
+  function resumeSoon() {
+    clearResume();
+    [200, 600, 1300, 2500].forEach(function (delay) {
+      resumeTimers.push(setTimeout(function () { if (canResume()) safePlay(media); }, delay));
+    });
+  }
+
+  // The app is leaving the screen: a pause that landed just before we knew
+  // that was iOS's doing, so undo it too.
+  function onLeaving() {
+    if (pausedUnexplained && now() - lastPauseAt < 1500 && !userPaused && !interrupted) {
+      wantPlay = true;
+    }
+    pausedUnexplained = false;
+    if (canResume()) resumeSoon();
+  }
+
+  onRealVisibility = function (hidden) {
+    if (hidden) onLeaving();
+  };
+
+  // --- Media Session: lock screen & Control Center ---
+  // iOS's own lock-screen controls call these handlers. Ours record that the
+  // user asked (so a lock-screen pause is never auto-resumed) and then hand
+  // over to YouTube's handler, or act on the video directly.
+
+  var pageHandlers = {};
   var metadata = null;
   var session = navigator.mediaSession;
 
+  function userIntent(action) {
+    if (action === 'pause' || action === 'stop') {
+      userPaused = true;
+      wantPlay = false;
+      pausedUnexplained = false;
+      clearResume();
+    } else if (action === 'play') {
+      userPaused = false;
+      wantPlay = true;
+      interrupted = false;
+    } else if (action === 'nexttrack' || action === 'previoustrack') {
+      transitionUntil = now() + 3000;
+    }
+  }
+
+  function actionHandler(action) {
+    return function (details) {
+      userIntent(action);
+      var handler = pageHandlers[action];
+      if (handler) {
+        try { return handler.apply(this, arguments); } catch (e) {}
+      }
+      if (!media) return;
+      if (action === 'pause' || action === 'stop') media.pause();
+      else if (action === 'play') safePlay(media);
+      else if (action === 'seekto' && details && isFinite(details.seekTime)) media.currentTime = details.seekTime;
+    };
+  }
+
   if (session) {
     var nativeSetHandler = session.setActionHandler;
-    session.setActionHandler = function (action, handler) {
-      handlers[action] = handler;
-      try { return nativeSetHandler.call(session, action, handler); } catch (e) {}
+    var setNative = function (action, fn) {
+      try { nativeSetHandler.call(session, action, fn); } catch (e) {}
     };
+    session.setActionHandler = function (action, handler) {
+      pageHandlers[action] = handler || null;
+      var always = action === 'play' || action === 'pause';
+      setNative(action, handler || always ? actionHandler(action) : null);
+    };
+    setNative('play', actionHandler('play'));
+    setNative('pause', actionHandler('pause'));
+
     var metaDesc = window.MediaSession && Object.getOwnPropertyDescriptor(MediaSession.prototype, 'metadata');
     if (metaDesc && metaDesc.get && metaDesc.set) {
       try {
@@ -312,7 +416,7 @@
   } else {
     session = {
       playbackState: 'none',
-      setActionHandler: function (action, handler) { handlers[action] = handler; },
+      setActionHandler: function (action, handler) { pageHandlers[action] = handler || null; },
       setPositionState: function () {},
       setMicrophoneActive: function () {},
       setCameraActive: function () {}
@@ -339,7 +443,7 @@
     }
   }
 
-  // --- Reporting ---
+  // --- Reporting (in-app player bar, tab speaker icons) ---
 
   function cleanTitle() {
     return (document.title || '')
@@ -395,42 +499,12 @@
     reportTimer = setTimeout(function () { report(event); }, 60);
   }
 
-  // --- Playback control ---
-
-  function safePlay(m) {
-    try {
-      var p = m.play();
-      if (p && p.catch) p.catch(function () {});
-    } catch (e) {}
-  }
-
-  function shouldResume() {
-    return background && wantPlay && !userPaused && !interrupted &&
-           media && media.paused && !media.ended && Date.now() > transitionUntil;
-  }
-
-  function scheduleResume() {
-    clearTimeout(resumeTimer);
-    resumeTimer = setTimeout(function () {
-      if (shouldResume()) safePlay(media);
-    }, 250);  // leaves time for a call/headphone notice from the app to arrive first
-  }
-
-  // YouTube's idle "Continue watching?" check also listens for key presses;
-  // while in the background send a harmless Alt press once a minute.
-  setInterval(function () {
-    if (!background) return;
-    ['keydown', 'keyup'].forEach(function (type) {
-      try {
-        document.dispatchEvent(new KeyboardEvent(type, { bubbles: true, cancelable: true, keyCode: 18, which: 18 }));
-      } catch (e) {}
-    });
-  }, 60000);
+  // --- Next / previous ---
 
   function goNext() {
-    transitionUntil = Date.now() + 3000;
-    if (handlers.nexttrack) {
-      try { handlers.nexttrack({ action: 'nexttrack' }); return; } catch (e) {}
+    transitionUntil = now() + 3000;
+    if (pageHandlers.nexttrack) {
+      try { pageHandlers.nexttrack({ action: 'nexttrack' }); return; } catch (e) {}
     }
     var mp = document.getElementById('movie_player');
     if (mp && typeof mp.nextVideo === 'function') { mp.nextVideo(); return; }
@@ -440,9 +514,9 @@
 
   function goPrevious() {
     if (media && media.currentTime > 3) { media.currentTime = 0; scheduleReport('seeked'); return; }
-    transitionUntil = Date.now() + 3000;
-    if (handlers.previoustrack) {
-      try { handlers.previoustrack({ action: 'previoustrack' }); return; } catch (e) {}
+    transitionUntil = now() + 3000;
+    if (pageHandlers.previoustrack) {
+      try { pageHandlers.previoustrack({ action: 'previoustrack' }); return; } catch (e) {}
     }
     var mp = document.getElementById('movie_player');
     if (mp && typeof mp.previousVideo === 'function') { mp.previousVideo(); return; }
@@ -463,28 +537,30 @@
       case 'playing':
         wantPlay = true;
         userPaused = false;
+        pausedUnexplained = false;
         if (type === 'playing') interrupted = false;  // audio is flowing again
         break;
       case 'pause':
         if (adShowing()) return;
-        lastPauseAt = Date.now();
-        wantedBeforePause = wantPlay && !userPaused && Date.now() - lastTouchAt > 1000;
-        if ((background || leaving) && wantPlay && !userPaused && !interrupted && !m.ended) {
-          // iOS paused us on the way out (Home Screen, app switch, screen lock).
-          // Not the user's pause: keep wanting playback and undo it. Not
-          // reported, so the lock screen never flickers to "paused".
-          if (background) scheduleResume();
+        lastPauseAt = now();
+        if (userPaused || interrupted || m.ended || userJustTouched()) {
+          // Your pause (or a call): respected.
+          wantPlay = false;
+          pausedUnexplained = false;
+          break;
+        }
+        if (wantPlay && leavingScreen()) {
+          // iOS's pause on the way out: undo it. Not reported, so the lock
+          // screen never flips to "paused".
+          resumeSoon();
           return;
         }
+        pausedUnexplained = wantPlay;
         wantPlay = false;
         break;
       case 'ended':
         wantPlay = false;
-        if (background && !adShowing()) {
-          // Hop to the next song immediately, before iOS suspends the idle page.
-          wantPlay = true;
-          goNext();
-        }
+        pausedUnexplained = false;
         break;
     }
     scheduleReport(type);
@@ -498,8 +574,8 @@
     });
 
   document.addEventListener('timeupdate', function (e) {
-    if (e.target === media && Date.now() - lastTick > 10000) {
-      lastTick = Date.now();
+    if (e.target === media && now() - lastTick > 10000) {
+      lastTick = now();
       report('tick');
     }
   }, true);
@@ -508,78 +584,32 @@
     post({ type: 'media', event: 'gone' });
   });
 
-  // --- Miniplayer routing (YouTube app style) ---
-  // Normal tabs ('browse') hand every video to the app's player, so the page
-  // you came from stays exactly where it was. The player ('player') hands
-  // anything that isn't a video (home, search, channels) back to the tab.
-
-  var ROLE = window.__encoreRole || 'browse';
-
-  function youTubeURL(href) {
-    try {
-      var u = new URL(href, location.href);
-      return /(^|\.)youtube\.com$/.test(u.hostname) && u.hostname !== 'music.youtube.com' ? u : null;
-    } catch (e) { return null; }
-  }
-
-  function isWatch(u) {
-    return u.pathname === '/watch' && !!u.searchParams.get('v');
-  }
-
-  function route(u) {
-    if (ROLE === 'browse' && isWatch(u)) { post({ type: 'openVideo', url: u.href }); return true; }
-    if (ROLE === 'player' && !isWatch(u)) { post({ type: 'openInBrowser', url: u.href }); return true; }
-    return false;
-  }
-
-  if (IS_YT && location.hostname !== 'music.youtube.com') {
-    window.addEventListener('click', function (e) {
-      if (!e.isTrusted || e.defaultPrevented || !e.target || !e.target.closest) return;
-      var link = e.target.closest('a[href]');
-      var u = link && youTubeURL(link.getAttribute('href'));
-      if (u && route(u)) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-      }
-    }, true);
-
-    // Navigations YouTube starts from script rather than a link: let it
-    // happen (keeps YouTube's history consistent), hand the page over, then
-    // step straight back to where this view was.
-    var nativePushState = history.pushState;
-    history.pushState = function (state, title, url) {
-      var result = nativePushState.apply(this, arguments);
-      var u = url != null ? youTubeURL(String(url)) : null;
-      if (u && route(u)) {
-        if (ROLE === 'browse') {
-          var videos = document.querySelectorAll('video');
-          for (var i = 0; i < videos.length; i++) videos[i].pause();
-        }
-        setTimeout(function () { history.back(); }, 0);
-      }
-      return result;
-    };
-  }
+  // YouTube's idle "Continue watching?" check also listens for key presses;
+  // while off screen send a harmless Alt press once a minute.
+  setInterval(function () {
+    if (!reallyHidden()) return;
+    ['keydown', 'keyup'].forEach(function (type) {
+      try {
+        document.dispatchEvent(new KeyboardEvent(type, { bubbles: true, cancelable: true, keyCode: 18, which: 18 }));
+      } catch (e) {}
+    });
+  }, 60000);
 
   // --- API used by the app (window.__encore.*) ---
 
   window.__encore = {
     play: function () {
-      userPaused = false;
-      wantPlay = true;
-      interrupted = false;
+      userIntent('play');
       if (media) safePlay(media);
     },
     pause: function () {
-      userPaused = true;
-      wantPlay = false;
-      clearTimeout(resumeTimer);
+      userIntent('pause');
       if (media) media.pause();
     },
     toggle: function () {
       if (media && !media.paused) window.__encore.pause(); else window.__encore.play();
     },
-    next: function () { wantPlay = true; userPaused = false; goNext(); },
+    next: function () { userIntent('play'); goNext(); },
     previous: function () { goPrevious(); },
     seek: function (seconds) {
       if (media && isFinite(seconds)) { media.currentTime = seconds; scheduleReport('seeked'); }
@@ -588,27 +618,24 @@
     prepareBackground: function () {
       leaving = true;
       if (media && !media.paused && !media.ended && !userPaused) wantPlay = true;
+      onLeaving();
     },
     setBackground: function (value) {
-      background = !!value;
       leaving = false;
-      if (!background) return;
-      // Covers a pause that landed before any notice from the app arrived.
-      if (!wantPlay && wantedBeforePause && Date.now() - lastPauseAt < 1500) wantPlay = true;
-      window.__encore.kick();
+      backgroundAt = value ? now() : 0;
+      if (value) onLeaving();
     },
     kick: function () {
-      if (wantPlay && !userPaused && !interrupted && media && media.paused && !media.ended &&
-          Date.now() > transitionUntil) safePlay(media);
+      if (leavingScreen() && canResume()) safePlay(media);
     },
     interrupted: function (began, resume) {
       if (began) {
         if (!interrupted) {
           resumeAfterInterruption = !userPaused &&
-            ((media && !media.paused) || wantPlay || Date.now() - lastPauseAt < 2000);
+            ((media && !media.paused) || wantPlay || now() - lastPauseAt < 2000);
         }
         interrupted = true;
-        clearTimeout(resumeTimer);
+        clearResume();
         if (media && !media.paused) media.pause();
       } else {
         interrupted = false;

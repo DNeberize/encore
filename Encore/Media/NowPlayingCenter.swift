@@ -1,10 +1,14 @@
 import AVFoundation
-import MediaPlayer
 import UIKit
 
-/// Bridges the playing page to iOS: audio session, lock screen / Control
-/// Center info, remote commands (play, pause, next, scrubbing), interruptions
-/// and the sleep timer.
+/// Tracks what is playing (for the in-app player bar and tab icons), sets up
+/// the audio session, pauses for calls and unplugged headphones, and runs the
+/// sleep timer.
+///
+/// The lock screen / Control Center controls are WebKit's own: they drive the
+/// page directly (with the privilege to resume after iOS pauses it), and the
+/// page script records those taps as your intent. The app deliberately does
+/// not register a second set of controls, which would fight with them.
 @MainActor
 final class NowPlayingCenter: ObservableObject {
     static let shared = NowPlayingCenter()
@@ -13,7 +17,7 @@ final class NowPlayingCenter: ObservableObject {
     @Published private(set) var artwork: UIImage?
     @Published private(set) var sleepDeadline: Date?
 
-    /// The tab whose media is shown on the lock screen.
+    /// The tab whose media is playing (or last played).
     private(set) weak var tab: BrowserTab?
 
     private var artworkURL: URL?
@@ -28,8 +32,9 @@ final class NowPlayingCenter: ObservableObject {
     private var callMonitor: CallMonitor?
 
     private init() {
-        configureAudioSession()
-        configureRemoteCommands()
+        // Category only; WebKit activates the session when something plays, so
+        // opening the app doesn't stop music from other apps.
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
         observeAudioSession()
         callMonitor = CallMonitor { [weak self] active in
             Task { @MainActor in self?.callChanged(active) }
@@ -39,14 +44,13 @@ final class NowPlayingCenter: ObservableObject {
     // MARK: - Page updates
 
     func update(_ newState: MediaState, from source: BrowserTab) {
-        // A paused tab never steals the lock screen from the one that is playing.
+        // A paused tab never takes over from the one that is playing.
         guard newState.playing || tab == nil || tab === source else { return }
         if tab !== source {
             objectWillChange.send()
             tab = source
         }
         if newState.playing {
-            activateAudioSession()
             // Audio is flowing again, so any interruption is over (iOS doesn't
             // always send the "ended" notice).
             audioInterrupted = false
@@ -54,7 +58,6 @@ final class NowPlayingCenter: ObservableObject {
         }
         state = newState
         loadArtwork(newState.artworkURL)
-        publish()
     }
 
     func mediaGone(from source: BrowserTab) {
@@ -65,22 +68,20 @@ final class NowPlayingCenter: ObservableObject {
         artwork = nil
         artworkURL = nil
         artworkTask?.cancel()
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
     }
 
-    // MARK: - Commands
+    // MARK: - Commands (in-app player bar, sleep timer)
 
     func play() {
-        // An explicit play always wins, even during a call.
         audioInterrupted = false
         holding = false
         tab?.run("play()")
-        setOptimisticPlaying(true)
+        state?.playing = true
     }
 
     func pause() {
         tab?.run("pause()")
-        setOptimisticPlaying(false)
+        state?.playing = false
     }
 
     func togglePlayPause() {
@@ -88,19 +89,6 @@ final class NowPlayingCenter: ObservableObject {
     }
 
     func next() { tab?.run("next()") }
-    func previous() { tab?.run("previous()") }
-
-    func seek(to seconds: Double) {
-        tab?.run("seek(\(seconds))")
-        state?.position = seconds
-        publish()
-    }
-
-    private func setOptimisticPlaying(_ playing: Bool) {
-        guard state != nil else { return }
-        state?.playing = playing
-        publish()
-    }
 
     // MARK: - Sleep timer
 
@@ -119,29 +107,7 @@ final class NowPlayingCenter: ObservableObject {
         }
     }
 
-    // MARK: - Lock screen info
-
-    private func publish() {
-        guard let state else { return }
-        var info: [String: Any] = [
-            MPMediaItemPropertyTitle: state.title,
-            MPMediaItemPropertyArtist: state.artist,
-            MPNowPlayingInfoPropertyElapsedPlaybackTime: state.position,
-            MPNowPlayingInfoPropertyPlaybackRate: state.playing ? state.rate : 0.0,
-            MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0,
-            MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.audio.rawValue,
-            MPNowPlayingInfoPropertyIsLiveStream: state.live,
-        ]
-        if !state.album.isEmpty { info[MPMediaItemPropertyAlbumTitle] = state.album }
-        if state.duration > 0, !state.live { info[MPMediaItemPropertyPlaybackDuration] = state.duration }
-        if let artwork { info[MPMediaItemPropertyArtwork] = Self.makeArtwork(artwork) }
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
-    }
-
-    /// Built outside the main actor: iOS asks for the image on a background queue.
-    nonisolated private static func makeArtwork(_ image: UIImage) -> MPMediaItemArtwork {
-        MPMediaItemArtwork(boundsSize: image.size) { _ in image }
-    }
+    // MARK: - Artwork
 
     private func loadArtwork(_ url: URL?) {
         guard url != artworkURL else { return }
@@ -155,7 +121,6 @@ final class NowPlayingCenter: ObservableObject {
             let cropped = Self.squareCrop(image, isYouTubeThumbnail: url.host?.contains("ytimg.com") == true)
             guard let self, self.artworkURL == url else { return }
             self.artwork = cropped
-            self.publish()
         }
     }
 
@@ -175,17 +140,7 @@ final class NowPlayingCenter: ObservableObject {
         return UIImage(cgImage: cropped, scale: image.scale, orientation: image.imageOrientation)
     }
 
-    // MARK: - Audio session
-
-    private func configureAudioSession() {
-        // Category only; the session activates when something actually plays so
-        // opening the app doesn't stop music from other apps.
-        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
-    }
-
-    private func activateAudioSession() {
-        try? AVAudioSession.sharedInstance().setActive(true)
-    }
+    // MARK: - Calls and headphones
 
     private func observeAudioSession() {
         let center = NotificationCenter.default
@@ -208,8 +163,7 @@ final class NowPlayingCenter: ObservableObject {
             guard let raw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
                   AVAudioSession.RouteChangeReason(rawValue: raw) == .oldDeviceUnavailable else { return }
             // Wired headphones unplugged or Bluetooth/AirPods disconnected:
-            // pause and stay paused, like any music player. (Taking AirPods out
-            // of your ears sends a regular pause command instead.)
+            // pause and stay paused, like any music player.
             Task { @MainActor in self?.pause() }
         })
     }
@@ -220,51 +174,13 @@ final class NowPlayingCenter: ObservableObject {
         updateHold(resume: true)
     }
 
-    /// Pauses the page (without counting it as the user's pause) when a call or
-    /// other interruption starts, and resumes it afterwards if it was playing.
+    /// Pauses the page (without counting it as your pause) when a call or other
+    /// interruption starts, and resumes it afterwards if it was playing.
     private func updateHold(resume: Bool) {
         let shouldHold = audioInterrupted || callActive
         guard shouldHold != holding else { return }
         holding = shouldHold
         tab?.run("interrupted(\(shouldHold), \(resume))")
-        if shouldHold { setOptimisticPlaying(false) }
-    }
-
-    // MARK: - Remote commands
-
-    private func configureRemoteCommands() {
-        let center = MPRemoteCommandCenter.shared()
-
-        center.playCommand.addTarget { [weak self] _ in
-            Task { @MainActor in self?.play() }
-            return .success
-        }
-        center.pauseCommand.addTarget { [weak self] _ in
-            Task { @MainActor in self?.pause() }
-            return .success
-        }
-        center.togglePlayPauseCommand.addTarget { [weak self] _ in
-            Task { @MainActor in self?.togglePlayPause() }
-            return .success
-        }
-        center.nextTrackCommand.addTarget { [weak self] _ in
-            Task { @MainActor in self?.next() }
-            return .success
-        }
-        center.previousTrackCommand.addTarget { [weak self] _ in
-            Task { @MainActor in self?.previous() }
-            return .success
-        }
-        center.changePlaybackPositionCommand.addTarget { [weak self] event in
-            guard let event = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
-            let position = event.positionTime
-            Task { @MainActor in self?.seek(to: position) }
-            return .success
-        }
-
-        center.skipForwardCommand.isEnabled = false
-        center.skipBackwardCommand.isEnabled = false
-        center.seekForwardCommand.isEnabled = false
-        center.seekBackwardCommand.isEnabled = false
+        if shouldHold { state?.playing = false }
     }
 }
