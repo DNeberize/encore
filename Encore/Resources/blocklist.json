@@ -401,46 +401,6 @@
   },
   {
     "trigger": {
-      "url-filter": "^[^:]+://+([^:/]+\\.)?youtube\\.com/ptracking"
-    },
-    "action": {
-      "type": "block"
-    }
-  },
-  {
-    "trigger": {
-      "url-filter": "^[^:]+://+([^:/]+\\.)?youtube\\.com/get_midroll_"
-    },
-    "action": {
-      "type": "block"
-    }
-  },
-  {
-    "trigger": {
-      "url-filter": "^[^:]+://+([^:/]+\\.)?youtube\\.com/youtubei/v1/player/ad_break"
-    },
-    "action": {
-      "type": "block"
-    }
-  },
-  {
-    "trigger": {
-      "url-filter": "^[^:]+://+([^:/]+\\.)?youtube\\.com/pcs/activeview"
-    },
-    "action": {
-      "type": "block"
-    }
-  },
-  {
-    "trigger": {
-      "url-filter": "^[^:]+://+([^:/]+\\.)?youtube\\.com/api/stats/atr"
-    },
-    "action": {
-      "type": "block"
-    }
-  },
-  {
-    "trigger": {
       "url-filter": "^[^:]+://+([^:/]+\\.)?google\\.com/pagead/"
     },
     "action": {

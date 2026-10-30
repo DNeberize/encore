@@ -7,8 +7,9 @@ An iPhone browser built to use YouTube as a music player.
 - Keeps playing when you go to the Home Screen, switch apps or lock the phone
 - Shows lock screen and Control Center controls: play/pause, next, previous, a scrubber and artwork
 - Remembers your YouTube/Google login and your open tabs
-- Lets you use tabs: music keeps playing in its tab while you browse in another, and a mini player shows what's on
-- Sleep timer, pull to refresh, swipe back/forward, and AirPlay and Picture in Picture support
+- Has a YouTube-app-style miniplayer: videos open in a player that slides up; swipe it down (or tap ⌄) and it shrinks to a bar while you keep scrolling home or search exactly where you left off
+- Lets you use tabs: music keeps playing while you browse other sites
+- Sleep timer, swipe back/forward, and AirPlay and Picture in Picture support
 - Pauses for phone and VoIP calls (FaceTime, WhatsApp, ...) for the whole call and picks back up when it ends
 - Pauses when headphones are unplugged or AirPods/Bluetooth disconnect (or when you take AirPods out), and stays paused
 
@@ -74,7 +75,7 @@ You can't build iPhone apps on Windows, so GitHub's free Mac build machines do i
 ## Troubleshooting
 
 - **An ad got through.** YouTube changes its ad system often. The ad logic is all in [`Encore/Resources/encore.js`](Encore/Resources/encore.js) and [`Encore/Resources/blocklist.json`](Encore/Resources/blocklist.json). Update them, push, and reinstall the new build.
-- **Playback stopped after locking.** Press play on the lock screen. It resumes in the background. If it happens every time, open an issue with your iOS version.
+- **Playback stopped after locking.** Make sure you're on the latest build (the app should resume within about a second on its own). Pressing play on the lock screen also resumes it in the background.
 - **Google says "this browser may not be secure".** Go back and try again, or sign in at `accounts.google.com` in a tab first.
 - **Sideloadly can't see the phone.** Reinstall iTunes from apple.com (not the Microsoft Store), reconnect the cable and tap Trust.
 

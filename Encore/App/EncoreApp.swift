@@ -5,16 +5,12 @@ import UIKit
 struct EncoreApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var store = BrowserStore()
-    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
             BrowserView()
                 .environmentObject(store)
                 .tint(.encoreAccent)
-                .onChange(of: scenePhase) { phase in
-                    store.scenePhaseChanged(phase)
-                }
         }
     }
 }
@@ -30,5 +26,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 }
 
 extension Color {
-    static let encoreAccent = Color(red: 1.0, green: 0.22, blue: 0.37)
+    /// Electric blue, matching the app icon.
+    static let encoreAccent = Color(red: 0.16, green: 0.56, blue: 1.0)
+    static let encoreAccentDeep = Color(red: 0.31, green: 0.27, blue: 0.90)
 }

@@ -16,7 +16,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Minimal page environment
 // ---------------------------------------------------------------------------
 
-function makePage({ nativeMediaSession = false } = {}) {
+function makePage({ nativeMediaSession = false, role = 'browse' } = {}) {
   const timers = [];
   const posted = [];
   const ctx = vm.createContext({
@@ -45,7 +45,7 @@ function makePage({ nativeMediaSession = false } = {}) {
     // Dispatch along window -> document -> target (capture), then bubble.
     function dispatch(target, type) {
       let stopped = false;
-      const ev = { type, target, stopImmediatePropagation() { stopped = true; }, stopPropagation() { stopped = true; } };
+      const ev = { type, target, isTrusted: true, stopImmediatePropagation() { stopped = true; }, stopPropagation() { stopped = true; } };
       const path = [window, document];
       for (const node of path) {
         for (const fn of (node.capture[type] || [])) { if (stopped) return ev; fn(ev); }
@@ -111,12 +111,35 @@ function makePage({ nativeMediaSession = false } = {}) {
 
     class Navigator {}
     var navigator = new Navigator();
-    class Response { constructor(body) { this.body = body; } json() { return Promise.resolve(JSON.parse(this.body)); } }
+    class Response {
+      constructor(body, url) { this.body = body; this.url = url || ''; }
+      text() { return Promise.resolve(this.body); }
+      json() { return Promise.resolve(JSON.parse(this.body)); }
+    }
+    class XMLHttpRequest {
+      open(method, url) { this._url = url; }
+      setBody(b) { this._body = b; }
+    }
+    Object.defineProperty(XMLHttpRequest.prototype, 'responseText', { configurable: true, get() { return this._body; } });
+    Object.defineProperty(XMLHttpRequest.prototype, 'response', { configurable: true, get() { return this._body; } });
+    class Node {
+      appendChild(n) { return n; }
+      insertBefore(n) { return n; }
+    }
+    var history = {
+      backs: 0, pushed: [],
+      pushState(s, t, url) { this.pushed.push(url); },
+      replaceState() {},
+      back() { this.backs++; },
+    };
+    window.fetch = function fetch() {};
+    window.Request = function Request() {};
 
     window.webkit = { messageHandlers: { encore: { postMessage: (m) => window.__posted.push(m) } } };
     window.__posted = [];
     window.__encoreAdblock = true;
-    window.__test = { video, classes, styles, dispatch, HTMLMediaElement, Response };
+    window.__encoreRole = ${JSON.stringify(role)};
+    window.__test = { video, classes, styles, dispatch, HTMLMediaElement, Response, XMLHttpRequest, Node };
   `, ctx);
 
   if (nativeMediaSession) {
@@ -209,6 +232,58 @@ async function startPlaying(p) {
     expect(p.video.paused, 'paused right after iOS pause');
     await sleep(700);
     expect(!p.video.paused, 'should be playing again in the background');
+  });
+
+  await test('Home Screen / lock: iOS pauses BEFORE the app reports background -> resumes', async (page) => {
+    const p = page();
+    await startPlaying(p);
+    p.api.prepareBackground();               // will resign active
+    p.systemPause();                          // WebKit pauses the video
+    await sleep(80);
+    p.api.setBackground(true);               // did enter background
+    await sleep(80);
+    expect(!p.video.paused, 'should be playing again');
+    expect(p.posted().every((m) => m.event !== 'pause'), 'lock screen never shown as paused');
+  });
+
+  await test('no "resign active" notice at all, pause then background -> resumes', async (page) => {
+    const p = page();
+    await startPlaying(p);
+    p.systemPause();
+    await sleep(120);
+    p.api.setBackground(true);
+    await sleep(80);
+    expect(!p.video.paused, 'should be playing again');
+  });
+
+  await test('iOS keeps re-pausing / first play() refused -> retries win', async (page) => {
+    const p = page();
+    await startPlaying(p);
+    p.api.prepareBackground();
+    p.run('window.__blockPlay = true');       // WebKit refuses the first attempts
+    p.systemPause();
+    p.api.setBackground(true);
+    await sleep(400);
+    expect(p.video.paused, 'still paused while refused');
+    p.run('window.__blockPlay = false');
+    p.api.kick();                              // the app's retry
+    await sleep(80);
+    expect(!p.video.paused, 'retry resumes');
+    p.systemPause();                           // paused again later
+    await sleep(400);
+    expect(!p.video.paused, 'resumes again');
+  });
+
+  await test('Control Center pulled down and back: keeps playing, later pause respected', async (page) => {
+    const p = page();
+    await startPlaying(p);
+    p.api.prepareBackground();
+    p.api.setBackground(false);               // became active again
+    await sleep(50);
+    expect(!p.video.paused, 'still playing');
+    p.video.pause();                          // user taps pause in YouTube
+    await sleep(400);
+    expect(p.video.paused, 'user pause respected');
   });
 
   await test('lock screen pause in background stays paused', async (page) => {
@@ -312,8 +387,10 @@ async function startPlaying(p) {
   await test('user paused in app, then locked phone: stays paused', async (page) => {
     const p = page();
     await startPlaying(p);
+    p.run('window.__test.dispatch(document, "touchstart")');
     p.video.pause();                          // tapped YouTube's pause button
     await sleep(50);
+    p.api.prepareBackground();
     p.api.setBackground(true);
     await sleep(700);
     p.api.kick();
@@ -410,18 +487,85 @@ async function startPlaying(p) {
     expect(css.includes('ad-slot-renderer{display:none!important}'), 'ad slots hidden');
   });
 
-  await test('ads: an ad that slips through is muted, skipped, sound restored after', async (page) => {
+  await test('ads: an ad that slips through is muted and skipped, never sped up or seeked', async (page) => {
     const p = page();
     await startPlaying(p);
+    p.run('window.__skips = 0; document.querySelectorAll = (s) => s.includes("skip") ? [{ click() { window.__skips++; } }] : []');
     p.classes.add('ad-showing');
-    p.video.currentTime = 1; p.video.duration = 15;
-    await sleep(350);
+    p.video.currentTime = 1; p.video.duration = 215;
+    await sleep(400);
     expect(p.video.muted === true, 'muted during ad');
-    expect(p.video.currentTime >= 14.8, 'jumped to end of ad');
+    expect(p.run('window.__skips') > 0, 'skip button pressed');
+    expect(p.video.currentTime === 1 && p.video.playbackRate === 1, 'no seeking / speed change (stalls stream)');
     p.classes.delete('ad-showing');
-    p.video.currentTime = 0; p.video.duration = 200;
-    await sleep(350);
-    expect(p.video.muted === false && p.video.playbackRate === 1, 'sound and speed restored');
+    await sleep(400);
+    expect(p.video.muted === false, 'sound restored');
+  });
+
+  await test('ads: raw player responses renamed like uBlock ("adPlacements" -> "no_ads")', async (page) => {
+    const p = page();
+    const body = '{"adPlacements":[{"x":1}],"adSlots":[2],"playerAds":[3],"streamingData":{"formats":[]}}';
+    const t = await p.run(`new window.__test.Response(${JSON.stringify(body)}, 'https://m.youtube.com/youtubei/v1/player?key=x').text()`);
+    expect(!/adPlacements|adSlots|playerAds/.test(t) && t.includes('"no_ads"') && t.includes('streamingData'), 'fetch text: ' + t);
+    const j = await p.run(`new window.__test.Response(${JSON.stringify(body)}, 'https://m.youtube.com/youtubei/v1/player').json()`);
+    expect(!('adPlacements' in j) && j.streamingData, 'fetch json');
+    const other = await p.run(`new window.__test.Response(${JSON.stringify(body)}, 'https://m.youtube.com/youtubei/v1/browse').text()`);
+    expect(other === body, 'unrelated endpoints untouched');
+    const x = p.run(`const r = new window.__test.XMLHttpRequest(); r.open('GET', '/watch?v=abc&pbj=1'); r.setBody(${JSON.stringify(body)}); r.responseText`);
+    expect(!/adPlacements/.test(x), 'xhr renamed');
+  });
+
+  await test('ads: YouTube\'s 17-second anti-blocker delay runs almost instantly', async (page) => {
+    const p = page();
+    p.run('window.__fired = 0; setTimeout((function () { window.__fired++; }).bind(null), 17000)');
+    p.run('window.__other = 0; setTimeout(function () { window.__other++; }, 17000)');
+    await sleep(120);
+    expect(p.run('window.__fired') === 1, 'native-code 17s timer fired early');
+    expect(p.run('window.__other') === 0, 'ordinary 17s timers untouched');
+  });
+
+  await test('ads: hidden iframes get the filtered fetch (no clean-fetch bypass)', async (page) => {
+    const p = page();
+    const ok = p.run(`
+      const cw = { fetch: 'clean', Request: 'clean', JSON: { parse: 'clean' } };
+      new window.__test.Node().appendChild({ nodeName: 'IFRAME', contentWindow: cw });
+      cw.fetch !== 'clean' && cw.Request === window.Request && cw.JSON.parse === JSON.parse
+    `);
+    expect(ok === true, 'iframe patched');
+  });
+
+  await test('miniplayer: tapping a video in YouTube opens it in the player, page stays put', async (page) => {
+    const p = page();
+    p.run(`window.__link = { closest: () => ({ getAttribute: () => '/watch?v=xyz&list=RD1' }) }`);
+    const ev = p.run(`(() => { const e = { type: 'click', target: window.__link, isTrusted: true, defaultPrevented: false,
+      preventDefault() { this.defaultPrevented = true; }, stopImmediatePropagation() { this.stopped = true; } };
+      (window.capture.click || []).forEach(f => f(e)); return e; })()`);
+    expect(ev.defaultPrevented && ev.stopped, 'YouTube navigation cancelled');
+    const m = p.posted().find((x) => x.type === 'openVideo');
+    expect(m && m.url === 'https://m.youtube.com/watch?v=xyz&list=RD1', 'player asked to open: ' + JSON.stringify(m));
+  });
+
+  await test('miniplayer: inside the player, related videos stay; home/search go to the tab', async (page) => {
+    const p = page({ role: 'player' });
+    const click = (href) => p.run(`(() => { const e = { type: 'click', isTrusted: true, defaultPrevented: false,
+      target: { closest: () => ({ getAttribute: () => ${JSON.stringify(href)} }) },
+      preventDefault() { this.defaultPrevented = true; }, stopImmediatePropagation() {} };
+      (window.capture.click || []).forEach(f => f(e)); return e.defaultPrevented; })()`);
+    expect(click('/watch?v=next1') === false, 'related video plays in the player');
+    expect(click('/results?search_query=x') === true, 'search handed to the tab');
+    const m = p.posted().find((x) => x.type === 'openInBrowser');
+    expect(m && m.url.endsWith('/results?search_query=x'), 'tab asked to open search');
+  });
+
+  await test('miniplayer: script navigation to a video is handed over and the page steps back', async (page) => {
+    const p = page();
+    p.run('history.pushState({}, "", "/watch?v=scripted")');
+    await sleep(30);
+    expect(p.posted().some((x) => x.type === 'openVideo' && x.url.includes('v=scripted')), 'handed to player');
+    expect(p.run('history.backs') === 1, 'browse page returned to where it was');
+    p.run('history.pushState({}, "", "/results?search_query=a")');
+    await sleep(30);
+    expect(p.run('history.backs') === 1, 'normal navigation untouched');
   });
 
   await test('ad blocking off: player responses untouched', async () => {
@@ -436,6 +580,7 @@ async function startPlaying(p) {
       class Navigator {} var navigator = new Navigator();
       class Response { json() { return Promise.resolve({}); } }
       class HTMLMediaElement {}
+      var history = { pushState() {}, back() {} };
       window.__encoreAdblock = false;
     `, ctx);
     vm.runInContext(SCRIPT, ctx);
