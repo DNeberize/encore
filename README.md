@@ -9,7 +9,8 @@ An iPhone browser built to use YouTube as a music player.
 - Remembers your YouTube/Google login and your open tabs
 - Lets you use tabs: music keeps playing in its tab while you browse in another, and a mini player shows what's on
 - Sleep timer, pull to refresh, swipe back/forward, and AirPlay and Picture in Picture support
-- Handles phone calls (resumes afterwards), and pauses when headphones are unplugged
+- Pauses for phone and VoIP calls (FaceTime, WhatsApp, ...) for the whole call and picks back up when it ends
+- Pauses when headphones are unplugged or AirPods/Bluetooth disconnect (or when you take AirPods out), and stays paused
 
 You need: a Windows PC, a USB cable for the iPhone, a free GitHub account and a free Apple ID.
 
@@ -88,6 +89,7 @@ Encore/Media                Audio session, lock screen info, remote controls, sl
 Encore/UI                   SwiftUI screens (toolbar, tabs, mini player)
 Encore/Resources/encore.js  Injected page script: background play, ad removal, media bridge
 Encore/Resources/blocklist.json  Network/cosmetic ad block rules
+tests/encore.test.js        Playback/ad scenarios for the page script (run: node tests/encore.test.js)
 ```
 
 If you have a Mac, run `brew install xcodegen && xcodegen generate`, open `Encore.xcodeproj`, choose your Apple ID under Signing & Capabilities and press Run.

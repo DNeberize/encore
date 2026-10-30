@@ -329,7 +329,7 @@
     clearTimeout(resumeTimer);
     resumeTimer = setTimeout(function () {
       if (shouldResume()) safePlay(media);
-    }, 350);
+    }, 500);  // leaves time for a call/headphone notice from the app to arrive first
   }
 
   function goNext() {
@@ -368,6 +368,7 @@
       case 'playing':
         wantPlay = true;
         userPaused = false;
+        if (type === 'playing') interrupted = false;  // audio is flowing again
         break;
       case 'pause':
         if (adShowing()) return;
@@ -415,11 +416,13 @@
     play: function () {
       userPaused = false;
       wantPlay = true;
+      interrupted = false;
       if (media) safePlay(media);
     },
     pause: function () {
       userPaused = true;
       wantPlay = false;
+      clearTimeout(resumeTimer);
       if (media) media.pause();
     },
     toggle: function () {
@@ -439,9 +442,13 @@
     },
     interrupted: function (began, resume) {
       if (began) {
+        if (!interrupted) {
+          resumeAfterInterruption = !userPaused &&
+            ((media && !media.paused) || wantPlay || Date.now() - lastPauseAt < 2000);
+        }
         interrupted = true;
-        resumeAfterInterruption = !userPaused &&
-          ((media && !media.paused) || wantPlay || Date.now() - lastPauseAt < 2000);
+        clearTimeout(resumeTimer);
+        if (media && !media.paused) media.pause();
       } else {
         interrupted = false;
         if (resume && resumeAfterInterruption) window.__encore.play();

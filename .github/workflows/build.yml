@@ -12,6 +12,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Test page script
+        run: node tests/encore.test.js
+
       - name: Install XcodeGen
         run: brew install xcodegen
 

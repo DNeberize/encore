@@ -21,10 +21,19 @@ final class NowPlayingCenter: ObservableObject {
     private var sleepTimer: Timer?
     private var observers: [NSObjectProtocol] = []
 
+    // Playback is held (paused, no auto-resume) while either of these is true.
+    private var audioInterrupted = false
+    private var callActive = false
+    private var holding = false
+    private var callMonitor: CallMonitor?
+
     private init() {
         configureAudioSession()
         configureRemoteCommands()
         observeAudioSession()
+        callMonitor = CallMonitor { [weak self] active in
+            Task { @MainActor in self?.callChanged(active) }
+        }
     }
 
     // MARK: - Page updates
@@ -36,7 +45,13 @@ final class NowPlayingCenter: ObservableObject {
             objectWillChange.send()
             tab = source
         }
-        if newState.playing { activateAudioSession() }
+        if newState.playing {
+            activateAudioSession()
+            // Audio is flowing again, so any interruption is over (iOS doesn't
+            // always send the "ended" notice).
+            audioInterrupted = false
+            holding = callActive
+        }
         state = newState
         loadArtwork(newState.artworkURL)
         publish()
@@ -56,6 +71,9 @@ final class NowPlayingCenter: ObservableObject {
     // MARK: - Commands
 
     func play() {
+        // An explicit play always wins, even during a call.
+        audioInterrupted = false
+        holding = false
         tab?.run("play()")
         setOptimisticPlaying(true)
     }
@@ -180,16 +198,36 @@ final class NowPlayingCenter: ObservableObject {
             let shouldResume = AVAudioSession.InterruptionOptions(rawValue: rawOptions).contains(.shouldResume)
             let began = type == .began
             Task { @MainActor in
-                self?.tab?.run("interrupted(\(began), \(shouldResume))")
+                guard let self else { return }
+                self.audioInterrupted = began
+                self.updateHold(resume: shouldResume)
             }
         })
         observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification,
                                             object: nil, queue: .main) { [weak self] note in
             guard let raw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
                   AVAudioSession.RouteChangeReason(rawValue: raw) == .oldDeviceUnavailable else { return }
-            // Headphones unplugged / AirPods removed: pause like any music player.
+            // Wired headphones unplugged or Bluetooth/AirPods disconnected:
+            // pause and stay paused, like any music player. (Taking AirPods out
+            // of your ears sends a regular pause command instead.)
             Task { @MainActor in self?.pause() }
         })
+    }
+
+    private func callChanged(_ active: Bool) {
+        callActive = active
+        // When the call ends, pick the music back up (like Apple Music).
+        updateHold(resume: true)
+    }
+
+    /// Pauses the page (without counting it as the user's pause) when a call or
+    /// other interruption starts, and resumes it afterwards if it was playing.
+    private func updateHold(resume: Bool) {
+        let shouldHold = audioInterrupted || callActive
+        guard shouldHold != holding else { return }
+        holding = shouldHold
+        tab?.run("interrupted(\(shouldHold), \(resume))")
+        if shouldHold { setOptimisticPlaying(false) }
     }
 
     // MARK: - Remote commands
