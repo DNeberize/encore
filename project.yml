@@ -32,6 +32,8 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         NSAppTransportSecurity:
           NSAllowsArbitraryLoadsInWebContent: true
+          NSAllowsLocalNetworking: true
+        NSLocalNetworkUsageDescription: Live script reloading connects to npm run dev on your computer.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.encore.player

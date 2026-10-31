@@ -1,0 +1,9 @@
+{
+  "name": "encore",
+  "private": true,
+  "description": "Dev scripts for Encore's page script (the app itself is built by CI)",
+  "scripts": {
+    "dev": "node tools/dev-server.js",
+    "test": "node tests/encore.test.js"
+  }
+}

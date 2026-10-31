@@ -79,6 +79,18 @@ You can't build iPhone apps on Windows, so GitHub's free Mac build machines do i
 - **Google says "this browser may not be secure".** Go back and try again, or sign in at `accounts.google.com` in a tab first.
 - **Sideloadly can't see the phone.** Reinstall iTunes from apple.com (not the Microsoft Store), reconnect the cable and tap Trust.
 
+## Live development (no rebuild for script changes)
+
+The ad blocking and playback logic is in `encore.js` and `blocklist.json`. You can change them live on the iPhone, from Windows, without rebuilding:
+
+1. On the PC, in the repo folder, run `npm run dev`. It prints an address such as `172.20.10.5:8787`. The first time, allow Node.js through the Windows Firewall on **Private networks**.
+2. In the app: **••• → Live Script Server**, type that address and tap **Connect**. The first time, allow **Local Network** access. The menu then shows **Live Script · Connected**.
+3. Edit `Encore/Resources/encore.js` or `blocklist.json` and save. The app's pages reload with the new files. The page's `console.log` output and errors show up in the terminal.
+
+The phone and the PC must be on the same network (the same Wi-Fi, or the PC on the iPhone's hotspot). Turn it off in the same menu. Changes to the Swift code still need a new build. When you're happy with your script changes, push them so the next build includes them.
+
+`npm test` runs the page script tests.
+
 ## Project layout
 
 ```
@@ -90,7 +102,8 @@ Encore/Media                Audio session, calls/headphones, sleep timer (lock s
 Encore/UI                   SwiftUI screens (toolbar, tabs, mini player)
 Encore/Resources/encore.js  Injected page script: background play, ad removal, media bridge
 Encore/Resources/blocklist.json  Network/cosmetic ad block rules
-tests/encore.test.js        Playback/ad scenarios for the page script (run: node tests/encore.test.js)
+tests/encore.test.js        Playback/ad scenarios for the page script (run: npm test)
+tools/dev-server.js         Live script server for the app (run: npm run dev)
 ```
 
 If you have a Mac, run `brew install xcodegen && xcodegen generate`, open `Encore.xcodeproj`, choose your Apple ID under Signing & Capabilities and press Run.

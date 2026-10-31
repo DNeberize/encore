@@ -19,7 +19,17 @@ final class BrowserStore: ObservableObject {
             tabs.forEach { $0.reloadIfLoaded() }
         }
     }
+    /// Address of `npm run dev` on the computer ("" = off). See DevServer.
+    @Published var devServerAddress: String {
+        didSet {
+            guard devServerAddress != oldValue else { return }
+            UserDefaults.standard.set(devServerAddress, forKey: Keys.devServer)
+            devServer.connect(to: devServerAddress)
+        }
+    }
+    @Published private(set) var devServerConnected = false
 
+    private let devServer = DevServer()
     private let userContent = WKUserContentController()
     private let router = ScriptMessageRouter()
     private var ruleList: WKContentRuleList?
@@ -30,12 +40,14 @@ final class BrowserStore: ObservableObject {
 
     private enum Keys {
         static let adBlock = "adBlockEnabled"
+        static let devServer = "devServerAddress"
         static let sessionURLs = "session.urls"
         static let sessionSelected = "session.selected"
     }
 
     init() {
         adBlockEnabled = UserDefaults.standard.object(forKey: Keys.adBlock) as? Bool ?? true
+        devServerAddress = UserDefaults.standard.string(forKey: Keys.devServer) ?? ""
         router.store = self
         userContent.add(router, name: "encore")
         installScripts()
@@ -45,6 +57,7 @@ final class BrowserStore: ObservableObject {
             ruleList = await AdBlocker.loadRuleList()
             applyContentRules()
             restoreSession()
+            startDevServer()
         }
     }
 
@@ -201,13 +214,67 @@ final class BrowserStore: ObservableObject {
 
     private func installScripts() {
         userContent.removeAllUserScripts()
-        guard let url = Bundle.main.url(forResource: "encore", withExtension: "js"),
-              let source = try? String(contentsOf: url, encoding: .utf8) else { return }
-        let prelude = "window.__encoreAdblock = \(adBlockEnabled);\n"
+        guard let source = devServer.script ?? Bundle.main.url(forResource: "encore", withExtension: "js")
+            .flatMap({ try? String(contentsOf: $0, encoding: .utf8) }) else { return }
+        var prelude = "window.__encoreAdblock = \(adBlockEnabled);\n"
+        if devServer.script != nil { prelude += Self.consoleForwarder }
         userContent.addUserScript(WKUserScript(source: prelude + source,
                                                injectionTime: .atDocumentStart,
                                                forMainFrameOnly: false))
     }
+
+    // MARK: - Live development
+
+    private func startDevServer() {
+        devServer.onConnectionChange = { [weak self] in
+            guard let self else { return }
+            devServerConnected = devServer.isConnected
+        }
+        devServer.onFilesChange = { [weak self] in self?.reloadDevFiles() }
+        devServer.connect(to: devServerAddress)
+    }
+
+    /// Swaps in the computer's (or, when live mode ends, the bundled) script and
+    /// block list, then reloads the open pages so they run the new copy.
+    private func reloadDevFiles() {
+        installScripts()
+        Task {
+            ruleList = await AdBlocker.loadRuleList(json: devServer.blocklist) { [weak self] error in
+                self?.devServer.log("error", "blocklist.json failed to compile: \(error.localizedDescription)")
+            }
+            applyContentRules()
+            tabs.forEach { $0.reloadIfLoaded() }
+            devServer.log("info", "Reloaded \(tabs.count) tab(s) with the new files")
+        }
+    }
+
+    /// Live mode only: copies the page's console output and uncaught errors to
+    /// the `npm run dev` terminal.
+    private static let consoleForwarder = """
+    (function () {
+      var bridge = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.encore;
+      if (!bridge) return;
+      function send(level, args) {
+        try {
+          var text = Array.prototype.map.call(args, function (v) {
+            if (typeof v === 'string') return v;
+            if (v instanceof Error) return v.stack || String(v);
+            try { return JSON.stringify(v); } catch (e) { return String(v); }
+          }).join(' ');
+          bridge.postMessage({ type: 'log', level: level, text: text, page: location.host });
+        } catch (e) {}
+      }
+      ['log', 'info', 'warn', 'error', 'debug'].forEach(function (level) {
+        var original = console[level];
+        console[level] = function () { send(level, arguments); return original.apply(console, arguments); };
+      });
+      window.addEventListener('error', function (e) {
+        send('error', [e.message + ' (' + e.filename + ':' + e.lineno + ':' + e.colno + ')']);
+      });
+      window.addEventListener('unhandledrejection', function (e) { send('error', ['Unhandled rejection:', e.reason]); });
+    })();
+
+    """
 
     private func applyContentRules() {
         userContent.removeAllContentRuleLists()
@@ -219,8 +286,14 @@ final class BrowserStore: ObservableObject {
     fileprivate func handle(_ message: WKScriptMessage) {
         guard let webView = message.webView,
               let tab = tabs.first(where: { $0.webView === webView }),
-              let body = message.body as? [String: Any],
-              body["type"] as? String == "media" else { return }
+              let body = message.body as? [String: Any] else { return }
+
+        if body["type"] as? String == "log" {
+            devServer.log(body["level"] as? String ?? "log", body["text"] as? String ?? "",
+                          page: body["page"] as? String ?? "")
+            return
+        }
+        guard body["type"] as? String == "media" else { return }
 
         if body["event"] as? String == "gone" {
             tab.isPlayingMedia = false

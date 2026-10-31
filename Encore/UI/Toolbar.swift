@@ -7,6 +7,9 @@ struct Toolbar: View {
     @Binding var editing: Bool
     var onShowTabs: () -> Void
 
+    @State private var editingDevServer = false
+    @State private var devServerDraft = ""
+
     private let haptics = UIImpactFeedbackGenerator(style: .light)
 
     var body: some View {
@@ -28,6 +31,19 @@ struct Toolbar: View {
             ProgressLine(progress: tab.progress, visible: tab.isLoading)
         }
         .animation(.spring(response: 0.3, dampingFraction: 0.88), value: editing)
+        .alert("Live Script Server", isPresented: $editingDevServer) {
+            TextField("192.168.1.20:8787", text: $devServerDraft)
+                .keyboardType(.URL)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            Button("Connect") { store.devServerAddress = devServerDraft }
+            if !store.devServerAddress.isEmpty {
+                Button("Turn Off", role: .destructive) { store.devServerAddress = "" }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Run npm run dev on your computer (same Wi-Fi) and type the address it prints. The app then uses encore.js and blocklist.json from there and reloads when you save them.")
+        }
     }
 
     // MARK: - Address
@@ -151,6 +167,21 @@ struct Toolbar: View {
                 sleepTimerMenu
                 Toggle(isOn: $store.adBlockEnabled) {
                     Label("Block Ads", systemImage: "shield.lefthalf.filled")
+                }
+            }
+
+            Section {
+                Button {
+                    devServerDraft = store.devServerAddress
+                    editingDevServer = true
+                } label: {
+                    if store.devServerAddress.isEmpty {
+                        Label("Live Script Server", systemImage: "antenna.radiowaves.left.and.right")
+                    } else if store.devServerConnected {
+                        Label("Live Script · Connected", systemImage: "antenna.radiowaves.left.and.right")
+                    } else {
+                        Label("Live Script · Not Connected", systemImage: "antenna.radiowaves.left.and.right.slash")
+                    }
                 }
             }
         } label: {
