@@ -9,6 +9,9 @@
  *     left the screen, it is resumed on the spot. Pauses you make (in the
  *     page, on the lock screen / Control Center, or by the app for calls and
  *     unplugged headphones) are always respected.
+ *  4. (Top frame) the app's two pages: "browse" (home, search, channels)
+ *     hands every video to "player" (the watch page, full screen or the mini
+ *     player), so browsing keeps its place while something plays.
  */
 (function () {
   'use strict';
@@ -18,6 +21,7 @@
   var ADBLOCK = window.__encoreAdblock !== false;
   var IS_TOP = window.top === window;
   var IS_YT = /(^|\.)(youtube\.com|youtube-nocookie\.com)$/.test(location.hostname);
+  var IS_PLAYER = window.__encoreRole === 'player';
   var bridge = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.encore;
 
   function post(msg) {
@@ -26,6 +30,16 @@
 
   function player() {
     return document.querySelector('.html5-video-player');
+  }
+
+  function addCSS(css) {
+    var add = function () {
+      var style = document.createElement('style');
+      style.textContent = css;
+      (document.head || document.documentElement).appendChild(style);
+    };
+    if (document.documentElement) add();
+    else document.addEventListener('DOMContentLoaded', add);
   }
 
   function adShowing() {
@@ -240,13 +254,7 @@
       '.ytp-ad-image-overlay',
       '.ytp-ad-text-overlay'
     ];
-    var addStyle = function () {
-      var style = document.createElement('style');
-      style.textContent = HIDE.map(function (s) { return s + '{display:none!important}'; }).join('\n');
-      (document.head || document.documentElement).appendChild(style);
-    };
-    if (document.documentElement) addStyle();
-    else document.addEventListener('DOMContentLoaded', addStyle);
+    addCSS(HIDE.map(function (s) { return s + '{display:none!important}'; }).join('\n'));
 
     // Fallback for an ad that still gets through: keep it silent and press
     // Skip as soon as it appears. No speeding up or seeking: that stalls the
@@ -482,6 +490,7 @@
     post({
       type: 'media',
       event: event,
+      video: id || '',
       playing: !m.paused && !m.ended,
       title: (md && md.title) || cleanTitle(),
       artist: (md && md.artist) || channelName() || location.hostname.replace(/^(www|m)\./, ''),
@@ -595,6 +604,96 @@
     });
   }, 60000);
 
+  // ---------------------------------------------------------------------------
+  // 4. The app's two pages
+  // ---------------------------------------------------------------------------
+
+  var IS_MAIN_YT = /^(m|www)\.youtube\.com$|^youtube\.com$/.test(location.hostname);
+  var ownClick = false;      // our own navigate() click: never intercepted
+
+  function isVideoPath(path) {
+    return path === '/watch' || /^\/live\/[^/]+$/.test(path);
+  }
+
+  function currentPath() {
+    try { return new URL(location.href).pathname; } catch (e) { return ''; }
+  }
+
+  // In-page navigation through YouTube's own router (no page reload): a click
+  // on a link, like a tap on any of YouTube's own.
+  function navigate(href) {
+    var url;
+    try { url = new URL(href, location.href); } catch (e) { return false; }
+    var app = document.querySelector('ytm-app');
+    if (!app || !/(^|\.)youtube\.com$/.test(url.hostname)) return false;
+    var a = document.createElement('a');
+    a.href = url.pathname + url.search + url.hash;
+    a.style.display = 'none';
+    app.appendChild(a);
+    ownClick = true;
+    try { a.click(); } finally { ownClick = false; a.remove(); }
+    return true;
+  }
+
+  if (IS_MAIN_YT) {
+    if (IS_PLAYER) {
+      // Watch page like the YouTube app: video at the very top, no top bar
+      // (YouTube's own "header in player" layout) and no tab bar.
+      addCSS([
+        'ytm-mobile-topbar-renderer,ytm-pivot-bar-renderer{display:none!important}',
+        '.player-container.sticky-player{top:0!important}',
+        'ytm-app.sticky-player{padding-top:0!important}',
+        'html.watch-scroll.sticky-player{scroll-padding-top:56.25vw!important}'
+      ].join('\n'));
+    } else {
+      // Room at the end of the page so the mini player never covers the last item.
+      addCSS('ytm-app::after{content:"";display:block;height:var(--encore-bottom-inset,0px)}');
+    }
+
+    // Videos tapped while browsing go to the player; anything else tapped in
+    // the player (a channel, a hashtag, Shorts) goes back to browsing.
+    window.addEventListener('click', function (e) {
+      if (ownClick || e.defaultPrevented || e.button > 0 || e.metaKey || e.ctrlKey || e.shiftKey) return;
+      var a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
+      if (!a) return;
+      var url;
+      try { url = new URL(a.getAttribute('href'), location.href); } catch (err) { return; }
+      if (!/(^|\.)youtube\.com$/.test(url.hostname) || url.hostname === 'music.youtube.com') return;
+      var video = isVideoPath(url.pathname);
+      if (IS_PLAYER === video) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      post({ type: IS_PLAYER ? 'browse' : 'openVideo', url: url.href });
+    }, true);
+
+    // Route changes. Browsing never stays on a watch page (one opened some
+    // other way than a link goes to the player too); the player reports
+    // where it is so the app knows when the video has gone.
+    var lastPath = currentPath();
+    var onRoute = function (pushed) {
+      var path = currentPath();
+      if (path === lastPath) return;
+      lastPath = path;
+      var video = isVideoPath(path);
+      if (!IS_PLAYER && video && pushed && !ownClick) {
+        post({ type: 'openVideo', url: location.href });
+        history.back();
+        return;
+      }
+      post({ type: 'route', url: location.href, video: video });
+    };
+    ['pushState', 'replaceState'].forEach(function (name) {
+      var original = history[name];
+      if (typeof original !== 'function') return;
+      history[name] = function () {
+        var result = original.apply(this, arguments);
+        onRoute(name === 'pushState');
+        return result;
+      };
+    });
+    window.addEventListener('popstate', function () { onRoute(false); });
+  }
+
   // --- API used by the app (window.__encore.*) ---
 
   window.__encore = {
@@ -643,6 +742,26 @@
         resumeAfterInterruption = false;
       }
     },
-    state: function () { report('state'); }
+    state: function () { report('state'); },
+    // Opens a YouTube URL in this page without reloading it. False if it can't.
+    open: function (href) { return navigate(href); },
+    // Stops everything in the page (feed previews too), e.g. when a video opens.
+    pauseAll: function () {
+      if (media && !media.paused) window.__encore.pause();
+      var videos = document.querySelectorAll('video');
+      for (var i = 0; i < videos.length; i++) {
+        if (!videos[i].paused) videos[i].pause();
+      }
+    },
+    setBottomInset: function (px) {
+      try { document.documentElement.style.setProperty('--encore-bottom-inset', (px | 0) + 'px'); } catch (e) {}
+    },
+    // Top of YouTube's bottom tab bar (CSS px from the top of the viewport).
+    tabBarTop: function () {
+      var bar = document.querySelector('ytm-pivot-bar-renderer');
+      if (!bar) return null;
+      var rect = bar.getBoundingClientRect();
+      return rect.height > 0 ? rect.top : null;
+    }
   };
 })();

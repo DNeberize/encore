@@ -2,6 +2,7 @@ import Foundation
 
 /// Playback snapshot reported by the page script.
 struct MediaState: Equatable {
+    var videoID: String
     var playing: Bool
     var title: String
     var artist: String
@@ -15,6 +16,7 @@ struct MediaState: Equatable {
     init?(_ body: [String: Any]) {
         guard let playing = body["playing"] as? Bool else { return nil }
         self.playing = playing
+        videoID = body["video"] as? String ?? ""
         let title = (body["title"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         self.title = title.isEmpty ? "Now Playing" : title
         artist = body["artist"] as? String ?? ""

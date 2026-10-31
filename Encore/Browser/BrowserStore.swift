@@ -1,15 +1,23 @@
 import SwiftUI
 import WebKit
 
-/// Owns every tab plus the pieces they share: cookies/logins (the default
-/// website data store), the injected page script and the ad-block rule list.
+/// Owns the app's two YouTube pages plus what they share: cookies/logins (the
+/// default website data store), the injected page script and the ad-block
+/// rule list.
+///
+/// - `browse`: home, search, channels, Shorts. It never leaves for a video, so
+///   it keeps its place (scroll position included) while something plays.
+/// - `player`: the watch page, in the `PlayerDock` panel (full screen or the
+///   mini player). It is loaded at launch, so opening a video is an in-page
+///   navigation of an already running YouTube instead of a fresh page load.
 @MainActor
 final class BrowserStore: ObservableObject {
     static let home = URL(string: "https://m.youtube.com/")!
-    static let youTubeMusic = URL(string: "https://music.youtube.com/")!
 
-    @Published private(set) var tabs: [BrowserTab] = []
-    @Published private(set) var selectedID: UUID?
+    enum Role: String {
+        case browse, player
+    }
+
     @Published var adBlockEnabled: Bool {
         didSet {
             guard adBlockEnabled != oldValue else { return }
@@ -29,93 +37,178 @@ final class BrowserStore: ObservableObject {
     }
     @Published private(set) var devServerConnected = false
 
+    private(set) var browse: BrowserTab!
+    private(set) var player: BrowserTab!
+    let dock = PlayerDock()
+    var tabs: [BrowserTab] { [browse, player] }
+
     private let devServer = DevServer()
-    private let userContent = WKUserContentController()
+    private let browseContent = WKUserContentController()
+    private let playerContent = WKUserContentController()
     private let router = ScriptMessageRouter()
     private var ruleList: WKContentRuleList?
     private var lifecycleObservers: [NSObjectProtocol] = []
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+    /// The video the player is switching to (its thumbnail covers the page until then).
+    private var pendingVideoID: String?
 
-    var selectedTab: BrowserTab? { tabs.first { $0.id == selectedID } }
+    private var contents: [(Role, WKUserContentController)] {
+        [(.browse, browseContent), (.player, playerContent)]
+    }
 
     private enum Keys {
         static let adBlock = "adBlockEnabled"
         static let devServer = "devServerAddress"
-        static let sessionURLs = "session.urls"
-        static let sessionSelected = "session.selected"
     }
 
     init() {
         adBlockEnabled = UserDefaults.standard.object(forKey: Keys.adBlock) as? Bool ?? true
         devServerAddress = UserDefaults.standard.string(forKey: Keys.devServer) ?? ""
         router.store = self
-        userContent.add(router, name: "encore")
+        contents.forEach { $0.1.add(router, name: "encore") }
         installScripts()
+        browse = BrowserTab(role: .browse, configuration: makeConfiguration(browseContent), store: self)
+        player = BrowserTab(role: .player, configuration: makeConfiguration(playerContent), store: self)
+        setUpDock()
         observeAppLifecycle()
 
         Task {
             ruleList = await AdBlocker.loadRuleList()
             applyContentRules()
-            restoreSession()
+            browse.load(Self.home)
             startDevServer()
         }
     }
 
-    // MARK: - Tabs
+    // MARK: - Videos
 
-    @discardableResult
-    func openTab(url: URL?, select: Bool = true, configuration: WKWebViewConfiguration? = nil) -> BrowserTab {
-        let tab = BrowserTab(configuration: configuration ?? makeConfiguration(), store: self)
-        tab.pendingURL = url
-        if let current = selectedTab, let index = tabs.firstIndex(where: { $0 === current }) {
-            tabs.insert(tab, at: index + 1)
+    /// Plays a video in the player, full screen, from wherever you are.
+    func openVideo(_ url: URL) {
+        let watch = URLResolver.youTubeVideo(url) ?? url
+        pendingVideoID = URLResolver.videoID(watch)
+        browse.run("pauseAll()")
+        measureTabBar()
+        dock.showCover(videoID: pendingVideoID)
+        dock.present()
+        player.open(watch)
+        let id = pendingVideoID
+        Task {
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            if pendingVideoID == id { pendingVideoID = nil }
+        }
+    }
+
+    /// Shows a YouTube page in browsing; a playing video shrinks to the mini player.
+    func showInBrowse(_ url: URL) {
+        dock.minimize()
+        browse.open(url)
+    }
+
+    func closePlayer() {
+        player.run("pause()")
+        NowPlayingCenter.shared.mediaGone(from: player)
+        player.isPlayingMedia = false
+        pendingVideoID = nil
+        dock.update(nil)
+        dock.hide()
+        // Leave the watch page so the lock screen lets go of the video too.
+        player.run("open('/')")
+    }
+
+    func pageDidLoad(_ tab: BrowserTab) {
+        guard tab === browse else { return }
+        measureTabBar()
+        guard player.webView.url == nil else { return }
+        // Start the player's YouTube once browsing is up, so the first video opens fast.
+        Task {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            if player.webView.url == nil { player.load(Self.home) }
+        }
+    }
+
+    private func setUpDock() {
+        dock.attach(player.webView)
+        dock.onClose = { [weak self] in self?.closePlayer() }
+        dock.onTogglePlay = { [weak self] in self?.player.run("toggle()") }
+        dock.menu = { [weak self] in self?.makeMenu() ?? UIMenu(children: []) }
+        dock.onModeChange = { [weak self] mode in
+            guard let self else { return }
+            browse.run("setBottomInset(\(mode == .mini ? Int(PlayerDock.miniHeight) : 0))")
+            if mode == .mini { measureTabBar() }
+        }
+    }
+
+    /// Finds YouTube's tab bar on the browse page so the mini player can sit on it.
+    private func measureTabBar() {
+        browse.value("tabBarTop()") { [weak self] result in
+            guard let self else { return }
+            guard let top = (result as? NSNumber).map({ CGFloat(truncating: $0) }) else {
+                dock.tabBarTop = nil
+                return
+            }
+            let webView = browse.webView
+            let point = CGPoint(x: 0, y: webView.scrollView.adjustedContentInset.top + top)
+            dock.tabBarTop = webView.convert(point, to: dock).y
+        }
+    }
+
+    // MARK: - Mini player menu
+
+    private func makeMenu() -> UIMenu {
+        let nowPlaying = NowPlayingCenter.shared
+        var sleepItems: [UIMenuElement] = [15, 30, 45, 60, 90].map { minutes in
+            UIAction(title: "\(minutes) minutes") { _ in nowPlaying.setSleepTimer(minutes: minutes) }
+        }
+        var sleepTitle = "Sleep Timer"
+        if let deadline = nowPlaying.sleepDeadline {
+            sleepTitle += " · \(max(1, Int(ceil(deadline.timeIntervalSinceNow / 60)))) min left"
+            sleepItems.append(UIAction(title: "Turn Off", attributes: .destructive) { _ in
+                nowPlaying.setSleepTimer(minutes: nil)
+            })
+        }
+        let sleep = UIMenu(title: sleepTitle, image: UIImage(systemName: "moon.zzz"), children: sleepItems)
+
+        let adBlock = UIAction(title: "Block Ads", image: UIImage(systemName: "shield.lefthalf.filled"),
+                               state: adBlockEnabled ? .on : .off) { [weak self] _ in
+            self?.adBlockEnabled.toggle()
+        }
+
+        let liveTitle: String
+        if devServerAddress.isEmpty {
+            liveTitle = "Live Script Server"
         } else {
-            tabs.append(tab)
+            liveTitle = devServerConnected ? "Live Script · Connected" : "Live Script · Not Connected"
         }
-        if select { self.select(tab) }
-        return tab
-    }
-
-    func select(_ tab: BrowserTab) {
-        if let current = selectedTab, current !== tab { current.captureSnapshot() }
-        selectedID = tab.id
-        tab.loadPendingIfNeeded()
-    }
-
-    func close(_ tab: BrowserTab) {
-        guard let index = tabs.firstIndex(where: { $0 === tab }) else { return }
-        NowPlayingCenter.shared.mediaGone(from: tab)
-        tab.teardown()
-        tabs.remove(at: index)
-        if tabs.isEmpty {
-            openTab(url: Self.home)
-        } else if selectedID == tab.id {
-            select(tabs[min(index, tabs.count - 1)])
+        let live = UIAction(title: liveTitle, image: UIImage(systemName: "antenna.radiowaves.left.and.right")) { [weak self] _ in
+            self?.editDevServer()
         }
+        return UIMenu(children: [sleep, UIMenu(options: .displayInline, children: [adBlock, live])])
     }
 
-    func closeAllTabs() {
-        for tab in tabs {
-            NowPlayingCenter.shared.mediaGone(from: tab)
-            tab.teardown()
+    private func editDevServer() {
+        let alert = UIAlertController(
+            title: "Live Script Server",
+            message: "Run npm run dev on your computer (same Wi-Fi) and type the address it prints. "
+                + "The app then uses encore.js and blocklist.json from there and reloads when you save them.",
+            preferredStyle: .alert)
+        let current = devServerAddress
+        alert.addTextField { field in
+            field.text = current
+            field.placeholder = "192.168.1.20:8787"
+            field.keyboardType = .URL
+            field.autocapitalizationType = .none
+            field.autocorrectionType = .no
         }
-        tabs.removeAll()
-        openTab(url: Self.home)
-    }
-
-    func newTab() { openTab(url: Self.home) }
-
-    func open(_ url: URL) {
-        if let tab = selectedTab { tab.load(url) } else { openTab(url: url) }
-    }
-
-    func goHome() { open(Self.home) }
-
-    /// Handles text typed into the address bar: a URL, a bare domain or a search.
-    func submit(_ text: String) {
-        let onYouTube = selectedTab?.url?.host?.contains("youtube.com") ?? true
-        guard let url = URLResolver.resolve(text, preferYouTube: onYouTube) else { return }
-        open(url)
+        alert.addAction(UIAlertAction(title: "Connect", style: .default) { [weak self, weak alert] _ in
+            self?.devServerAddress = alert?.textFields?.first?.text ?? ""
+        })
+        if !devServerAddress.isEmpty {
+            alert.addAction(UIAlertAction(title: "Turn Off", style: .destructive) { [weak self] _ in
+                self?.devServerAddress = ""
+            })
+        }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        Presenter.present(alert)
     }
 
     // MARK: - Lifecycle
@@ -129,11 +222,11 @@ final class BrowserStore: ObservableObject {
             store.tabs.forEach { $0.run("prepareBackground()") }
         }
         observe(UIApplication.didEnterBackgroundNotification) { store in
-            store.saveSession()
             store.enterBackground()
         }
         observe(UIApplication.didBecomeActiveNotification) { store in
             store.tabs.forEach { $0.run("setBackground(false)") }
+            store.readSettings()
         }
     }
 
@@ -143,6 +236,16 @@ final class BrowserStore: ObservableObject {
                 if let self { action(self) }
             }
         })
+    }
+
+    /// Picks up changes made in the Settings app (Settings → Encore).
+    private func readSettings() {
+        let defaults = UserDefaults.standard
+        if let enabled = defaults.object(forKey: Keys.adBlock) as? Bool, enabled != adBlockEnabled {
+            adBlockEnabled = enabled
+        }
+        let address = defaults.string(forKey: Keys.devServer) ?? ""
+        if address != devServerAddress { devServerAddress = address }
     }
 
     private func enterBackground() {
@@ -169,32 +272,11 @@ final class BrowserStore: ObservableObject {
         backgroundTask = .invalid
     }
 
-    private func saveSession() {
-        let urls = tabs.map { ($0.webView.url ?? $0.pendingURL)?.absoluteString ?? Self.home.absoluteString }
-        UserDefaults.standard.set(urls, forKey: Keys.sessionURLs)
-        UserDefaults.standard.set(tabs.firstIndex { $0.id == selectedID } ?? 0, forKey: Keys.sessionSelected)
-    }
-
-    private func restoreSession() {
-        // A tab that was showing a video comes back as YouTube home: nothing
-        // starts playing by itself on launch.
-        let urls = (UserDefaults.standard.stringArray(forKey: Keys.sessionURLs) ?? [])
-            .compactMap { URL(string: $0) }
-            .map { URLResolver.youTubeVideo($0) == nil ? $0 : Self.home }
-        guard !urls.isEmpty else {
-            openTab(url: Self.home)
-            return
-        }
-        let restored = urls.map { openTab(url: $0, select: false) }
-        let index = UserDefaults.standard.integer(forKey: Keys.sessionSelected)
-        select(restored[min(max(index, 0), restored.count - 1)])
-    }
-
     // MARK: - Web configuration
 
-    func makeConfiguration() -> WKWebViewConfiguration {
+    private func makeConfiguration(_ content: WKUserContentController) -> WKWebViewConfiguration {
         let config = WKWebViewConfiguration()
-        config.userContentController = userContent
+        config.userContentController = content
         config.websiteDataStore = .default()
         config.allowsInlineMediaPlayback = true
         config.allowsPictureInPictureMediaPlayback = true
@@ -213,14 +295,16 @@ final class BrowserStore: ObservableObject {
     }
 
     private func installScripts() {
-        userContent.removeAllUserScripts()
         guard let source = devServer.script ?? Bundle.main.url(forResource: "encore", withExtension: "js")
             .flatMap({ try? String(contentsOf: $0, encoding: .utf8) }) else { return }
-        var prelude = "window.__encoreAdblock = \(adBlockEnabled);\n"
-        if devServer.script != nil { prelude += Self.consoleForwarder }
-        userContent.addUserScript(WKUserScript(source: prelude + source,
+        for (role, content) in contents {
+            content.removeAllUserScripts()
+            var prelude = "window.__encoreAdblock = \(adBlockEnabled);\nwindow.__encoreRole = '\(role.rawValue)';\n"
+            if devServer.script != nil { prelude += Self.consoleForwarder }
+            content.addUserScript(WKUserScript(source: prelude + source,
                                                injectionTime: .atDocumentStart,
                                                forMainFrameOnly: false))
+        }
     }
 
     // MARK: - Live development
@@ -244,7 +328,7 @@ final class BrowserStore: ObservableObject {
             }
             applyContentRules()
             tabs.forEach { $0.reloadIfLoaded() }
-            devServer.log("info", "Reloaded \(tabs.count) tab(s) with the new files")
+            devServer.log("info", "Reloaded both pages with the new files")
         }
     }
 
@@ -261,7 +345,7 @@ final class BrowserStore: ObservableObject {
             if (v instanceof Error) return v.stack || String(v);
             try { return JSON.stringify(v); } catch (e) { return String(v); }
           }).join(' ');
-          bridge.postMessage({ type: 'log', level: level, text: text, page: location.host });
+          bridge.postMessage({ type: 'log', level: level, text: text, page: (window.__encoreRole || '') + ' ' + location.host });
         } catch (e) {}
       }
       ['log', 'info', 'warn', 'error', 'debug'].forEach(function (level) {
@@ -277,8 +361,10 @@ final class BrowserStore: ObservableObject {
     """
 
     private func applyContentRules() {
-        userContent.removeAllContentRuleLists()
-        if adBlockEnabled, let ruleList { userContent.add(ruleList) }
+        for (_, content) in contents {
+            content.removeAllContentRuleLists()
+            if adBlockEnabled, let ruleList { content.add(ruleList) }
+        }
     }
 
     // MARK: - Page messages
@@ -287,25 +373,62 @@ final class BrowserStore: ObservableObject {
         guard let webView = message.webView,
               let tab = tabs.first(where: { $0.webView === webView }),
               let body = message.body as? [String: Any] else { return }
+        let url = (body["url"] as? String).flatMap { URL(string: $0) }
 
-        if body["type"] as? String == "log" {
+        switch body["type"] as? String {
+        case "log":
             devServer.log(body["level"] as? String ?? "log", body["text"] as? String ?? "",
                           page: body["page"] as? String ?? "")
-            return
+        case "openVideo":
+            if let url { openVideo(url) }
+        case "browse":
+            if let url { showInBrowse(url) }
+        case "route":
+            if tab === browse {
+                measureTabBar()
+            } else if body["video"] as? Bool == false, dock.mode != .hidden, let url {
+                // The player left the watch page some other way (its video is gone):
+                // close it and show that page in browsing instead.
+                closePlayer()
+                browse.open(url)
+            }
+        case "media":
+            handleMedia(body, from: tab)
+        default:
+            break
         }
-        guard body["type"] as? String == "media" else { return }
+    }
 
+    private func handleMedia(_ body: [String: Any], from tab: BrowserTab) {
         if body["event"] as? String == "gone" {
             tab.isPlayingMedia = false
             NowPlayingCenter.shared.mediaGone(from: tab)
-        } else if let state = MediaState(body) {
-            tab.isPlayingMedia = state.playing
-            NowPlayingCenter.shared.update(state, from: tab)
+            if tab === player { dock.update(nil) }
+            return
         }
+        guard let state = MediaState(body) else { return }
+        let wasPlaying = tab.isPlayingMedia
+        tab.isPlayingMedia = state.playing
+
+        if tab === player {
+            // Media from the video we're switching away from doesn't count.
+            if let pending = pendingVideoID, !state.videoID.isEmpty, state.videoID != pending { return }
+            if pendingVideoID != nil {
+                pendingVideoID = nil
+                dock.hideCover()
+            }
+            guard dock.mode != .hidden else { return }
+            dock.update(state)
+            if state.playing, !wasPlaying { browse.run("pauseAll()") }
+        } else if state.playing, !wasPlaying, player.isPlayingMedia {
+            // Something with sound started while browsing (Shorts): the video pauses.
+            player.run("pause()")
+        }
+        NowPlayingCenter.shared.update(state, from: tab)
     }
 }
 
-/// Forwards page messages without the user content controller retaining the store.
+/// Forwards page messages without the user content controllers retaining the store.
 @MainActor
 private final class ScriptMessageRouter: NSObject, WKScriptMessageHandler {
     weak var store: BrowserStore?

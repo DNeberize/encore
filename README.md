@@ -1,15 +1,14 @@
 # Encore
 
-An iPhone browser built to use YouTube as a music player.
+An iPhone app that is just YouTube, built to use it as a music player.
 
-- Opens YouTube (m.youtube.com) on launch, and the address bar opens any other site
-- Blocks ads: YouTube video ads are removed before the player loads them, and a block list covers common ad networks on other sites. You can switch it off in the ••• menu
+- Opens YouTube (m.youtube.com) full screen: no address bar, no browser buttons
+- Mini player like the YouTube app: swipe a video down and it shrinks to a bar above YouTube's tabs while you keep scrolling home, search or wherever you were, exactly where you left it
+- Blocks ads: YouTube video ads are removed before the player loads them, and a block list covers common ad networks
 - Keeps playing when you go to the Home Screen, switch apps or lock the phone
 - Shows lock screen and Control Center controls: play/pause, next, previous, a scrubber and artwork
-- Remembers your YouTube/Google login and your open tabs
-- Lets you use tabs: music keeps playing while you browse other sites, with a small player bar to control it
-- YouTube Music (••• menu) has YouTube's own player bar that stays at the bottom while you browse
-- Sleep timer, swipe back/forward, and AirPlay and Picture in Picture support
+- Remembers your YouTube/Google login
+- Sleep timer, swipe back, and AirPlay and Picture in Picture support
 - Pauses for phone and VoIP calls (FaceTime, WhatsApp, ...) for the whole call and picks back up when it ends
 - Pauses when headphones are unplugged or AirPods/Bluetooth disconnect (or when you take AirPods out), and stays paused
 
@@ -54,7 +53,7 @@ You can't build iPhone apps on Windows, so GitHub's free Mac build machines do i
 
 ### Free Apple ID limits (Apple's rules, not the app's)
 
-- The install is valid for **7 days**. To renew it, plug in the phone and drag the same `Encore.ipa` into Sideloadly again. Your login and tabs are kept. Sideloadly also has an automatic refresh option (Wi-Fi, PC on) so you don't have to do this by hand.
+- The install is valid for **7 days**. To renew it, plug in the phone and drag the same `Encore.ipa` into Sideloadly again. Your login is kept. Sideloadly also has an automatic refresh option (Wi-Fi, PC on) so you don't have to do this by hand.
 - A free Apple ID can have up to 3 sideloaded apps at once.
 - A paid Apple Developer account ($99/yr) makes installs last a year. You don't need one.
 
@@ -65,18 +64,19 @@ You can't build iPhone apps on Windows, so GitHub's free Mac build machines do i
 | What | How |
 |---|---|
 | Play music in the background | Start a video, then lock the phone or switch apps. It keeps playing. |
+| Keep browsing while it plays | Swipe the video down (or the page down when it's at the top). It becomes the mini player and you're back where you were. |
+| Bring the video back | Tap the mini player or swipe it up |
+| Close the video | Tap ✕ on the mini player, or swipe it down |
 | Lock screen / Control Center | Play/pause, next/previous, drag the scrubber |
-| Browse other sites while listening | ••• → **New Tab** (or the tabs button). Music keeps playing in its own tab, and the mini player controls it. |
-| Search | Tap the address bar. On YouTube it searches YouTube, elsewhere it searches Google. |
-| Sleep timer | ••• → **Sleep Timer** |
-| Turn ad blocking on/off | ••• → **Block Ads** |
-| YouTube Music | ••• → **YouTube Music** |
+| Sleep timer | Long-press the mini player → **Sleep Timer** |
+| Turn ad blocking on/off | Long-press the mini player → **Block Ads**, or Settings → Encore |
+| Links to other sites | Open in Safari over the app; close it to get back |
 
 ## Troubleshooting
 
 - **An ad got through.** YouTube changes its ad system often. The ad logic is all in [`Encore/Resources/encore.js`](Encore/Resources/encore.js) and [`Encore/Resources/blocklist.json`](Encore/Resources/blocklist.json). Update them, push, and reinstall the new build.
 - **Playback stopped after locking.** Make sure you're on the latest build (the app should resume within about a second on its own). Pressing play on the lock screen also resumes it in the background.
-- **Google says "this browser may not be secure".** Go back and try again, or sign in at `accounts.google.com` in a tab first.
+- **Google says "this browser may not be secure".** Go back and try again.
 - **Sideloadly can't see the phone.** Reinstall iTunes from apple.com (not the Microsoft Store), reconnect the cable and tap Trust.
 
 ## Live development (no rebuild for script changes)
@@ -84,7 +84,7 @@ You can't build iPhone apps on Windows, so GitHub's free Mac build machines do i
 The ad blocking and playback logic is in `encore.js` and `blocklist.json`. You can change them live on the iPhone, from Windows, without rebuilding:
 
 1. On the PC, in the repo folder, run `npm run dev`. It prints an address such as `172.20.10.5:8787`. The first time, allow Node.js through the Windows Firewall on **Private networks**.
-2. In the app: **••• → Live Script Server**, type that address and tap **Connect**. The first time, allow **Local Network** access. The menu then shows **Live Script · Connected**.
+2. In the app, long-press the mini player (play any video and swipe it down) → **Live Script Server**, type that address and tap **Connect**. Or type it in Settings → Encore → Live Script Server. The first time, allow **Local Network** access. The menu then shows **Live Script · Connected**.
 3. Edit `Encore/Resources/encore.js` or `blocklist.json` and save. The app's pages reload with the new files. The page's `console.log` output and errors show up in the terminal.
 
 The phone and the PC must be on the same network (the same Wi-Fi, or the PC on the iPhone's hotspot). Turn it off in the same menu. Changes to the Swift code still need a new build. When you're happy with your script changes, push them so the next build includes them.
@@ -97,9 +97,9 @@ The phone and the PC must be on the same network (the same Wi-Fi, or the PC on t
 project.yml                 XcodeGen spec (CI turns it into an Xcode project)
 .github/workflows/build.yml Cloud build → unsigned Encore.ipa
 Encore/App                  App entry point
-Encore/Browser              Tabs, WKWebView setup, ad-block loading, URL handling
+Encore/Browser              The two YouTube pages (browse + player), WKWebView setup, ad blocking, links
 Encore/Media                Audio session, calls/headphones, sleep timer (lock screen controls are iOS's own)
-Encore/UI                   SwiftUI screens (toolbar, tabs, mini player)
+Encore/UI                   Main screen and the player panel (full screen / mini player)
 Encore/Resources/encore.js  Injected page script: background play, ad removal, media bridge
 Encore/Resources/blocklist.json  Network/cosmetic ad block rules
 tests/encore.test.js        Playback/ad scenarios for the page script (run: npm test)

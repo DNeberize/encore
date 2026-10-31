@@ -612,6 +612,73 @@ async function startPlaying(p) {
     expect('adPlacements' in parsed, 'should be untouched when disabled');
   });
 
+  // --- The app's two pages: browse hands videos to the player ---
+
+  // A tap on a link, through the page script's capture listener.
+  const tapLink = (p, href) => p.run(`(function () {
+    var ev = {
+      target: { closest: function () { return { getAttribute: function () { return ${JSON.stringify(href)}; } }; } },
+      button: 0, prevented: false,
+      preventDefault: function () { this.prevented = true; },
+      stopImmediatePropagation: function () {}
+    };
+    (window.capture.click || []).forEach(function (f) { f(ev); });
+    return ev.prevented;
+  })()`);
+
+  await test('browse: a tapped video opens in the player and the page stays put', async (page) => {
+    const p = page({ role: 'browse' });
+    expect(tapLink(p, '/watch?v=xyz&list=RD1') === true, 'video tap should be taken over');
+    const m = p.last();
+    expect(m && m.type === 'openVideo' && m.url === 'https://m.youtube.com/watch?v=xyz&list=RD1', 'openVideo: ' + JSON.stringify(m));
+    expect(tapLink(p, '/@LofiGirl') === false, 'channel link stays in browse');
+    expect(tapLink(p, '/shorts/abc') === false, 'Shorts stay in browse');
+  });
+
+  await test('player: related videos stay, other YouTube pages go to browse', async (page) => {
+    const p = page({ role: 'player' });
+    const before = p.posted().length;
+    expect(tapLink(p, '/watch?v=next') === false, 'related video plays in the player');
+    expect(p.posted().length === before, 'nothing sent for a related video');
+    expect(tapLink(p, '/@LofiGirl') === true, 'channel link taken over');
+    const m = p.last();
+    expect(m.type === 'browse' && m.url === 'https://m.youtube.com/@LofiGirl', 'browse: ' + JSON.stringify(m));
+  });
+
+  await test('player: watch page laid out like the app (no top bar, video at the top)', async (page) => {
+    const player = page({ role: 'player' });
+    const css = player.styles.map((s) => s.textContent).join('\n');
+    expect(/ytm-mobile-topbar-renderer[^{]*\{display:none/.test(css), 'top bar hidden');
+    expect(/\.player-container\.sticky-player\{top:0/.test(css), 'video at the top');
+    const browse = page({ role: 'browse' });
+    const browseCSS = browse.styles.map((s) => s.textContent).join('\n');
+    expect(!/topbar/.test(browseCSS), 'browse keeps its top bar');
+    expect(/--encore-bottom-inset/.test(browseCSS), 'browse has room for the mini player');
+  });
+
+  await test('browse: a watch page reached without a link still goes to the player', async (page) => {
+    const p = page({ role: 'browse' });
+    p.run(`location.href = 'https://m.youtube.com/results?search_query=x'; history.pushState({}, '', '/results?search_query=x')`);
+    p.run(`location.href = 'https://m.youtube.com/watch?v=zzz'; history.pushState({}, '', '/watch?v=zzz')`);
+    const m = p.last();
+    expect(m.type === 'openVideo' && m.url === 'https://m.youtube.com/watch?v=zzz', 'openVideo: ' + JSON.stringify(m));
+    expect(p.run('history.backs') === 1, 'browse went back to where it was');
+  });
+
+  await test('player: tells the app when it leaves the watch page', async (page) => {
+    const p = page({ role: 'player' });
+    p.run(`location.href = 'https://m.youtube.com/@LofiGirl'; history.pushState({}, '', '/@LofiGirl')`);
+    const m = p.last();
+    expect(m.type === 'route' && m.video === false && m.url === 'https://m.youtube.com/@LofiGirl', 'route: ' + JSON.stringify(m));
+    expect(p.run('history.backs') === 0, 'player never goes back by itself');
+  });
+
+  await test('media reports carry the video id', async (page) => {
+    const p = page({ role: 'player' });
+    await startPlaying(p);
+    expect(p.last().video === 'abc123', 'video id: ' + p.last().video);
+  });
+
   // -------------------------------------------------------------------------
   const failed = results.filter((r) => !r[0]);
   for (const [ok, name, err] of results) console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${err ? '\n      ' + err : ''}`);

@@ -1,7 +1,7 @@
 import AVFoundation
 import UIKit
 
-/// Tracks what is playing (for the in-app player bar and tab icons), sets up
+/// Tracks what is playing (for the mini player), sets up
 /// the audio session, pauses for calls and unplugged headphones, and runs the
 /// sleep timer.
 ///
@@ -17,7 +17,7 @@ final class NowPlayingCenter: ObservableObject {
     @Published private(set) var artwork: UIImage?
     @Published private(set) var sleepDeadline: Date?
 
-    /// The tab whose media is playing (or last played).
+    /// The page whose media is playing (or last played).
     private(set) weak var tab: BrowserTab?
 
     private var artworkURL: URL?
@@ -44,7 +44,7 @@ final class NowPlayingCenter: ObservableObject {
     // MARK: - Page updates
 
     func update(_ newState: MediaState, from source: BrowserTab) {
-        // A paused tab never takes over from the one that is playing.
+        // A paused page never takes over from the one that is playing.
         guard newState.playing || tab == nil || tab === source else { return }
         if tab !== source {
             objectWillChange.send()
@@ -70,7 +70,7 @@ final class NowPlayingCenter: ObservableObject {
         artworkTask?.cancel()
     }
 
-    // MARK: - Commands (in-app player bar, sleep timer)
+    // MARK: - Commands (sleep timer, headphones)
 
     func play() {
         audioInterrupted = false

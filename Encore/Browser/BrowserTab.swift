@@ -1,23 +1,17 @@
+import SafariServices
 import SwiftUI
 import WebKit
 
+/// One of the app's two YouTube pages (see BrowserStore.Role).
 @MainActor
 final class BrowserTab: NSObject, ObservableObject, Identifiable {
     let id = UUID()
+    let role: BrowserStore.Role
     let webView: WKWebView
     weak var store: BrowserStore?
 
-    /// URL to load the first time the tab is shown (restored tabs load lazily).
-    var pendingURL: URL?
-
-    @Published private(set) var title = ""
     @Published private(set) var url: URL?
-    @Published private(set) var progress: Double = 0
-    @Published private(set) var isLoading = false
-    @Published private(set) var canGoBack = false
-    @Published private(set) var canGoForward = false
     @Published private(set) var themeColor: UIColor?
-    @Published private(set) var snapshot: UIImage?
     @Published var isPlayingMedia = false
 
     private var observations: [NSKeyValueObservation] = []
@@ -31,62 +25,49 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
         "tel", "mailto", "sms", "facetime", "facetime-audio", "maps", "itms-apps", "itms-appss",
     ]
 
-    init(configuration: WKWebViewConfiguration, store: BrowserStore) {
+    init(role: BrowserStore.Role, configuration: WKWebViewConfiguration, store: BrowserStore) {
+        self.role = role
         webView = WKWebView(frame: .zero, configuration: configuration)
         self.store = store
         super.init()
 
         webView.navigationDelegate = self
         webView.uiDelegate = self
-        webView.allowsBackForwardNavigationGestures = true
+        // Edge swipes go back while browsing; the player has no history to go back to.
+        webView.allowsBackForwardNavigationGestures = role == .browse
         webView.backgroundColor = .systemBackground
         webView.isOpaque = false
         if #available(iOS 16.4, *) { webView.isInspectable = true }
         // No pull-to-refresh: swiping down on YouTube must never reload the page.
 
         observations = [
-            webView.observe(\.title) { [weak self] _, _ in Task { @MainActor in self?.syncState() } },
             webView.observe(\.url) { [weak self] _, _ in Task { @MainActor in self?.syncState() } },
-            webView.observe(\.estimatedProgress) { [weak self] _, _ in Task { @MainActor in self?.syncState() } },
-            webView.observe(\.isLoading) { [weak self] _, _ in Task { @MainActor in self?.syncState() } },
-            webView.observe(\.canGoBack) { [weak self] _, _ in Task { @MainActor in self?.syncState() } },
-            webView.observe(\.canGoForward) { [weak self] _, _ in Task { @MainActor in self?.syncState() } },
             webView.observe(\.themeColor) { [weak self] _, _ in Task { @MainActor in self?.syncState() } },
         ]
     }
 
     private func syncState() {
-        assign(\.title, webView.title ?? "")
-        assign(\.url, webView.url)
-        assign(\.progress, webView.estimatedProgress)
-        assign(\.isLoading, webView.isLoading)
-        assign(\.canGoBack, webView.canGoBack)
-        assign(\.canGoForward, webView.canGoForward)
-        assign(\.themeColor, webView.themeColor)
-    }
-
-    private func assign<T: Equatable>(_ keyPath: ReferenceWritableKeyPath<BrowserTab, T>, _ value: T) {
-        if self[keyPath: keyPath] != value { self[keyPath: keyPath] = value }
+        if url != webView.url { url = webView.url }
+        if themeColor != webView.themeColor { themeColor = webView.themeColor }
     }
 
     // MARK: - Actions
 
     func load(_ url: URL) {
-        pendingURL = nil
         webView.load(URLRequest(url: url))
     }
 
-    func loadPendingIfNeeded() {
-        guard let pendingURL, webView.url == nil else { return }
-        load(pendingURL)
+    /// Goes to a YouTube URL inside the already loaded page (YouTube's own
+    /// in-page navigation, no reload), or loads it if the page can't.
+    func open(_ url: URL) {
+        guard webView.url != nil else { return load(url) }
+        webView.evaluateJavaScript("window.__encore ? window.__encore.open(\(Self.jsString(url.absoluteString))) : false") { [weak self] result, _ in
+            if result as? Bool != true { self?.load(url) }
+        }
     }
 
     func reloadIfLoaded() {
         if webView.url != nil { webView.reload() }
-    }
-
-    func reloadOrStop() {
-        if webView.isLoading { webView.stopLoading() } else { webView.reload() }
     }
 
     /// Calls a function on the page script's `window.__encore` object.
@@ -94,22 +75,39 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
         webView.evaluateJavaScript("window.__encore && window.__encore.\(call); void 0", completionHandler: nil)
     }
 
-    func captureSnapshot() {
-        guard webView.url != nil else { return }
-        let config = WKSnapshotConfiguration()
-        config.snapshotWidth = 360
-        webView.takeSnapshot(with: config) { [weak self] image, _ in
-            if let image { self?.snapshot = image }
+    /// Calls a function on `window.__encore` and hands back its result.
+    func value(_ call: String, completion: @escaping (Any?) -> Void) {
+        webView.evaluateJavaScript("window.__encore ? window.__encore.\(call) : null") { result, _ in
+            completion(result)
         }
     }
 
-    func teardown() {
-        run("pause()")
-        webView.stopLoading()
-        webView.navigationDelegate = nil
-        webView.uiDelegate = nil
-        observations.forEach { $0.invalidate() }
-        observations.removeAll()
+    static func jsString(_ text: String) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: [text]),
+              let array = String(data: data, encoding: .utf8) else { return "''" }
+        return String(array.dropFirst().dropLast())
+    }
+
+    /// YouTube and Google sign-in stay in the app; any other site opens in Safari.
+    static func isInApp(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return true }
+        let domains = ["youtube.com", "youtube-nocookie.com", "google.com", "gstatic.com", "googleusercontent.com"]
+        return domains.contains { host == $0 || host.hasSuffix("." + $0) } || host.hasPrefix("google.")
+            || host.contains(".google.")
+    }
+
+    /// Where a youtube.com/redirect link (description links) really goes.
+    static func redirectTarget(_ url: URL) -> URL? {
+        guard url.host?.lowercased().hasSuffix("youtube.com") == true, url.path == "/redirect",
+              let target = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "q" })?.value else { return nil }
+        return URL(string: target)
+    }
+
+    private func showInSafari(_ url: URL) {
+        let safari = SFSafariViewController(url: url)
+        safari.dismissButtonStyle = .close
+        Presenter.present(safari)
     }
 }
 
@@ -123,9 +121,27 @@ extension BrowserTab: WKNavigationDelegate {
             decisionHandler(.allow)
             return
         }
+        let mainFrame = navigationAction.targetFrame?.isMainFrame ?? true
         switch scheme {
         case "http", "https":
-            decisionHandler(Self.allowWithoutAppLink)
+            if mainFrame, let target = Self.redirectTarget(url), !Self.isInApp(target) {
+                showInSafari(target)
+                decisionHandler(.cancel)
+            } else if mainFrame, role == .browse, let video = URLResolver.youTubeVideo(url) {
+                // A video reached some other way than an in-page link: play it in the player.
+                store?.openVideo(video)
+                decisionHandler(.cancel)
+            } else if mainFrame, !Self.isInApp(url) {
+                showInSafari(url)
+                decisionHandler(.cancel)
+            } else if mainFrame, role == .player, webView.url != nil, navigationAction.navigationType == .linkActivated,
+                      URLResolver.youTubeVideo(url) == nil {
+                // A YouTube page that isn't a video, linked from the watch page: browse it.
+                store?.showInBrowse(url)
+                decisionHandler(.cancel)
+            } else {
+                decisionHandler(Self.allowWithoutAppLink)
+            }
         case "about", "data", "blob", "file":
             decisionHandler(.allow)
         case _ where Self.externalSchemes.contains(scheme):
@@ -137,6 +153,10 @@ extension BrowserTab: WKNavigationDelegate {
         }
     }
 
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        store?.pageDidLoad(self)
+    }
+
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         // The page was killed (usually memory pressure); bring it back.
         webView.reload()
@@ -146,17 +166,22 @@ extension BrowserTab: WKNavigationDelegate {
 // MARK: - WKUIDelegate
 
 extension BrowserTab: WKUIDelegate {
-    /// `target=_blank` links and `window.open` (e.g. sign-in popups) open as new tabs.
+    /// `target=_blank` links and `window.open`: videos go to the player, YouTube
+    /// pages to browsing, other sites to Safari. No extra windows.
     func webView(_ webView: WKWebView,
                  createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction,
                  windowFeatures: WKWindowFeatures) -> WKWebView? {
-        guard navigationAction.targetFrame == nil, let store else { return nil }
-        return store.openTab(url: nil, configuration: configuration).webView
-    }
-
-    func webViewDidClose(_ webView: WKWebView) {
-        store?.close(self)
+        guard var url = navigationAction.request.url, let store else { return nil }
+        if let target = Self.redirectTarget(url) { url = target }
+        if let video = URLResolver.youTubeVideo(url) {
+            store.openVideo(video)
+        } else if Self.isInApp(url) {
+            store.showInBrowse(url)
+        } else if ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
+            showInSafari(url)
+        }
+        return nil
     }
 
     func webView(_ webView: WKWebView,
