@@ -327,15 +327,13 @@ final class PlayerDock: UIView {
     @objc private func togglePlay() { onTogglePlay?() }
 
     @objc private func closeTapped() { onClose?() }
-}
 
-// MARK: - UIGestureRecognizerDelegate
-
-extension PlayerDock: UIGestureRecognizerDelegate {
     /// A shrink swipe: downward, on the video or on a page scrolled to the top,
-    /// in portrait (in landscape the video owns the screen).
-    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-        guard gestureRecognizer === playerPan else { return true }
+    /// in portrait (in landscape the video owns the screen). UIView already has
+    /// this method, so it lives here as an override; it also answers as the
+    /// player pan's delegate.
+    override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard gestureRecognizer === playerPan else { return super.gestureRecognizerShouldBegin(gestureRecognizer) }
         guard mode == .full, !isBusy, bounds.width < bounds.height, let webView else { return false }
         let velocity = playerPan.velocity(in: self)
         guard velocity.y > 0, velocity.y > abs(velocity.x) * 1.2 else { return false }
@@ -344,7 +342,11 @@ extension PlayerDock: UIGestureRecognizerDelegate {
         let atTop = scrollView.contentOffset.y <= -scrollView.adjustedContentInset.top + 1
         return onVideo || atTop
     }
+}
 
+// MARK: - UIGestureRecognizerDelegate
+
+extension PlayerDock: UIGestureRecognizerDelegate {
     /// Lets the page keep its own touch handling (taps on the player's buttons)
     /// until the swipe takes over.
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,

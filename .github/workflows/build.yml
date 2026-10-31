@@ -23,8 +23,7 @@ jobs:
 
       - name: Build (unsigned)
         run: |
-          set -o pipefail
-          xcodebuild \
+          if ! xcodebuild \
             -project Encore.xcodeproj \
             -scheme Encore \
             -configuration Release \
@@ -34,8 +33,15 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            build | tee build.log | grep -E "error:|warning: .*Encore|BUILD" || true
-          test -d build/Build/Products/Release-iphoneos/Encore.app
+            build > build.log 2>&1; then
+            # Compiler errors as annotations: readable on the run page (and its API) without the log.
+            grep -E "error:" build.log | sort -u | head -40 | while IFS= read -r line; do echo "::error::$line"; done
+            tail -60 build.log
+            exit 1
+          fi
+          grep -E "warning: .*Encore|BUILD" build.log || true
+          # An unfinished build leaves an app folder without Info.plist; never package that.
+          test -f build/Build/Products/Release-iphoneos/Encore.app/Info.plist
 
       - name: Package IPA
         run: |
