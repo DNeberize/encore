@@ -638,9 +638,11 @@
   if (IS_MAIN_YT) {
     if (IS_PLAYER) {
       // Watch page like the YouTube app: video at the very top, no top bar
-      // (YouTube's own "header in player" layout) and no tab bar.
+      // (YouTube's own "header in player" layout) and no tab bar. Also no
+      // floating copy of the related-video chips: it pins itself under the top
+      // bar we hide, so it hung over the list; the chip row in the list stays.
       addCSS([
-        'ytm-mobile-topbar-renderer,ytm-pivot-bar-renderer{display:none!important}',
+        'ytm-mobile-topbar-renderer,ytm-pivot-bar-renderer,ytm-related-chip-cloud-renderer{display:none!important}',
         '.player-container.sticky-player{top:0!important}',
         'ytm-app.sticky-player{padding-top:0!important}',
         'html.watch-scroll.sticky-player{scroll-padding-top:56.25vw!important}'

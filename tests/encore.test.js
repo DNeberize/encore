@@ -650,6 +650,7 @@ async function startPlaying(p) {
     const css = player.styles.map((s) => s.textContent).join('\n');
     expect(/ytm-mobile-topbar-renderer[^{]*\{display:none/.test(css), 'top bar hidden');
     expect(/\.player-container\.sticky-player\{top:0/.test(css), 'video at the top');
+    expect(/ytm-related-chip-cloud-renderer\{display:none/.test(css), 'no floating chip bar over the related videos');
     const browse = page({ role: 'browse' });
     const browseCSS = browse.styles.map((s) => s.textContent).join('\n');
     expect(!/topbar/.test(browseCSS), 'browse keeps its top bar');
